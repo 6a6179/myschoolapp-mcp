@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+.env.local
+*.egg-info/
+dist/
+build/
+cookie.txt
+cookies.json
+cookies.txt
+.vscode/
+.idea/
+.pytest_cache/
+*.log
