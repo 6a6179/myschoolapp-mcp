@@ -9,6 +9,7 @@ school-specific.
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
 import os
 from datetime import date, timedelta
@@ -93,7 +94,7 @@ def config() -> dict[str, str]:
 
 
 @mcp.tool()
-def cookie_refresh() -> dict[str, Any]:
+async def cookie_refresh() -> dict[str, Any]:
     """Re-run the Playwright login flow to refresh the session cookie.
 
     Drives a fresh Microsoft OAuth login using SCHOOL_EMAIL / SCHOOL_PASS
@@ -113,8 +114,10 @@ def cookie_refresh() -> dict[str, Any]:
     from .auth import refresh_cookie
 
     global _client
+    # refresh_cookie() uses Playwright's sync API, which cannot run inside
+    # the asyncio event loop FastMCP runs us in. Offload to a worker thread.
     try:
-        path = refresh_cookie()
+        path = await asyncio.to_thread(refresh_cookie)
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
