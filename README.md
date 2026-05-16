@@ -17,9 +17,9 @@ client.
 
 ## Features
 
-About 27 typed tools covering the common student/parent surfaces:
+About 28 typed tools covering the common student/parent surfaces:
 
-- **Core** — `whoami`, `config`
+- **Core** — `whoami`, `config`, `cookie_refresh`
 - **Assignments** — `assignments` (bucketed, compact by default),
   `assignments_in_range`, `missing_assignments`, `assignment_options`,
   `assignment_status_labels`
@@ -90,7 +90,9 @@ myschoolapp-mcp-refresh
 This drives Microsoft OAuth login via Playwright and saves the
 resulting cookies. **2FA / MFA accounts are not supported by this
 flow.** When the cookie expires (typically every few weeks), just run
-it again.
+it again — or call the `cookie_refresh` tool from your MCP client, which
+does the same thing and then drops the cached HTTP client so subsequent
+calls pick up the fresh cookie.
 
 If 2FA is on, log in to the site in a normal browser, export your
 cookies with any standard cookie-export extension, and point

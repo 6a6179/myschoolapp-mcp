@@ -92,6 +92,42 @@ def config() -> dict[str, str]:
     }
 
 
+@mcp.tool()
+def cookie_refresh() -> dict[str, Any]:
+    """Re-run the Playwright login flow to refresh the session cookie.
+
+    Drives a fresh Microsoft OAuth login using SCHOOL_EMAIL / SCHOOL_PASS
+    from the environment, writes the new cookie to MSA_COOKIES_FILE (or the
+    default ~/.myschoolapp-mcp/cookie.txt), then drops the cached HTTP
+    client so subsequent tool calls use the new cookie.
+
+    Use this when other tools start returning HTML or 401/403 — i.e. when
+    the cookie has expired.
+
+    Takes roughly 10-30 seconds. Requires playwright + chromium installed
+    on the host. Does not work on 2FA / MFA accounts. On a server with a
+    new IP, Microsoft may demand additional verification and the flow will
+    fail; in that case, refresh on a trusted machine and copy the cookie
+    file over.
+    """
+    from .auth import refresh_cookie
+
+    global _client
+    try:
+        path = refresh_cookie()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+    if _client is not None:
+        try:
+            _client.close()
+        except Exception:
+            pass
+        _client = None
+
+    return {"ok": True, "cookie_path": str(path)}
+
+
 # ---------------------------------------------------------------------------
 # Assignments
 # ---------------------------------------------------------------------------
