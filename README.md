@@ -17,12 +17,13 @@ client.
 
 ## Features
 
-About 28 typed tools covering the common student/parent surfaces:
+About 29 typed tools covering the common student/parent surfaces:
 
 - **Core** — `whoami`, `config`, `cookie_refresh`
 - **Assignments** — `assignments` (bucketed, compact by default),
-  `assignments_in_range`, `missing_assignments`, `assignment_options`,
-  `assignment_status_labels`
+  `assignments_in_range`, `missing_assignments`, `assignment_detail`
+  (single assignment with downloads / submitted files / rubric),
+  `assignment_options`, `assignment_status_labels`
 - **Schedule** — `schedule`, `daily_announcement`
 - **Academics** — `student_terms`, `classes`, `gradebook`,
   `report_card_templates`, `transcript_templates`, `attendance`,

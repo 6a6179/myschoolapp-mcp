@@ -324,6 +324,217 @@ def assignment_options() -> dict[str, Any]:
     return _get_client().request("GET", "/api/Assignment/ViewAssignmentOptions")
 
 
+_ASSIGNMENT_DETAIL_FIELDS = (
+    "AssignmentId",
+    "AssignmentIndexId",
+    "SectionId",
+    "GroupName",
+    "ShortDescription",
+    "AssignmentType",
+    "AssignmentDate",
+    "DueDate",
+    "MaxPoints",
+    "Factor",
+    "ExtraCredit",
+    "IncGradeBook",
+    "IncCumGrade",
+    "PublishGrade",
+    "DropboxInd",
+    "DropboxNumFiles",
+    "DropBoxResub",
+    "OnPaperSubmission",
+    "RubricInd",
+    "RubricId",
+    "ParentRubricId",
+    "AssessmentInd",
+    "DiscussionInd",
+    "FormativeInd",
+    "PartialInd",
+    "PastDue",
+    "CanResubmit",
+    "CourseEnded",
+    "GroupEndDate",
+)
+
+_ASSIGNMENT_GRADE_FIELDS = (
+    "Grade",
+    "GradedComment",
+    "AssignmentStatus",
+    "AssignmentStatusType",
+    "LastSubmitDate",
+    "DateDue",
+    "Late",
+    "Missing",
+    "Exempt",
+    "Incomplete",
+    "Collected",
+    "ReadyInd",
+    "DropBoxToDo",
+    "HasGrade",
+    "MessageCount",
+)
+
+
+def _slim_download(d: dict[str, Any]) -> dict[str, Any]:
+    return {
+        k: d.get(k)
+        for k in ("FriendlyFileName", "ShortDescription", "DownloadUrl", "DownloadID")
+        if k in d
+    }
+
+
+def _slim_submission(s: dict[str, Any]) -> dict[str, Any]:
+    return {
+        k: s.get(k)
+        for k in (
+            "FileName",
+            "LastSubmitDate",
+            "DownloadUrl",
+            "DropBoxId",
+            "DropBoxFileId",
+            "Detail",
+            "ExternalId",
+            "GoogleExternalUrl",
+            "ReadyInd",
+        )
+        if k in s
+    }
+
+
+@mcp.tool()
+def assignment_detail(
+    assignment_index_id: int | str,
+    include_rubric: bool = False,
+    full: bool = False,
+) -> dict[str, Any]:
+    """View a single assignment with description, downloads, and submission.
+
+    The `assignment_index_id` is the number at the end of the assignment URL,
+    e.g. `/lms-assignment/assignment/assignment-student-view/41609904` →
+    `41609904`. This is the per-student index id, NOT the global AssignmentId
+    returned by `assignments()`. Use the AssignmentIndexId field from the
+    assignments list, or grab it from the browser URL.
+
+    Returns the assignment description (HTML), due / assigned / submitted
+    dates, max points, downloadable handouts/templates (`DownloadItems`),
+    external links (`LinkItems`), the student's submitted files
+    (`SubmittedFiles` with DownloadUrl), and grade / status info (`Grade`).
+
+    Set `include_rubric=True` to also fetch the rubric definition and any
+    per-criterion scores the teacher has assigned. Rubric results may be
+    empty if the assignment hasn't been graded yet.
+
+    Note: this tool is read-only. It does not upload submission files.
+    Submitting on a student's behalf is intentionally not implemented —
+    use the website for that.
+
+    Args:
+        assignment_index_id: The index id from the assignment URL.
+        include_rubric: Also fetch the rubric definition + student results.
+        full: Return raw, untrimmed responses.
+    """
+    client = _get_client()
+    aid = str(assignment_index_id)
+    sid = _student_id()
+    detail = client.request(
+        "GET",
+        "/api/assignment2/UserAssignmentDetailsGetAllStudentData",
+        params={
+            "assignmentIndexId": aid,
+            "studentUserId": sid,
+            "personaId": _persona_id(),
+        },
+    )
+
+    rubric_resp: dict[str, Any] | None = None
+    rubric_results_resp: dict[str, Any] | None = None
+    if include_rubric:
+        body = detail.get("body") if isinstance(detail, dict) else None
+        rubric_id = body.get("RubricId") if isinstance(body, dict) else None
+        if rubric_id:
+            rubric_resp = client.request(
+                "GET",
+                "/api/Rubric/AssignmentRubric/",
+                params={"id": str(rubric_id)},
+            )
+            rubric_results_resp = client.request(
+                "GET",
+                "/api/Rubric/RubricResultsGet/",
+                params={"assignmentIndexId": aid, "studentId": sid},
+            )
+
+    if full:
+        out: dict[str, Any] = {"detail": detail}
+        if rubric_resp is not None:
+            out["rubric"] = rubric_resp
+            out["rubric_results"] = rubric_results_resp
+        return out
+
+    body = detail.get("body") if isinstance(detail, dict) else None
+    if not isinstance(body, dict):
+        return {"detail": detail}
+
+    slim_body: dict[str, Any] = {
+        k: body.get(k) for k in _ASSIGNMENT_DETAIL_FIELDS if k in body
+    }
+    slim_body["LongDescription"] = body.get("LongDescription")
+    slim_body["DownloadItems"] = [
+        _slim_download(d) for d in (body.get("DownloadItems") or [])
+    ]
+    slim_body["LinkItems"] = body.get("LinkItems") or []
+    slim_body["SubmittedFiles"] = [
+        _slim_submission(s) for s in (body.get("SubmissionResults") or [])
+    ]
+    grade = body.get("AssignmentGrade") or {}
+    slim_body["Grade"] = {
+        k: grade.get(k) for k in _ASSIGNMENT_GRADE_FIELDS if k in grade
+    }
+
+    out = {
+        "detail": {
+            "status": detail.get("status"),
+            "url": detail.get("url"),
+            "body": slim_body,
+        }
+    }
+
+    if rubric_resp is not None:
+        rb_body = rubric_resp.get("body") if isinstance(rubric_resp, dict) else None
+        if isinstance(rb_body, dict):
+            slim_rb = {
+                "Name": rb_body.get("Name"),
+                "Description": rb_body.get("Description"),
+                "EvaluationType": rb_body.get("EvaluationType"),
+                "Skills": [
+                    {
+                        "Name": skl.get("Name"),
+                        "SortOrder": skl.get("SortOrder"),
+                        "Levels": [
+                            {
+                                "Name": lv.get("Name"),
+                                "Description": lv.get("Description"),
+                                "Points": lv.get("Points"),
+                                "PointsTo": lv.get("PointsTo"),
+                                "SortOrder": lv.get("SortOrder"),
+                            }
+                            for lv in (skl.get("Levels") or [])
+                        ],
+                    }
+                    for skl in (rb_body.get("Skills") or [])
+                ],
+            }
+            out["rubric"] = {
+                "status": rubric_resp.get("status"),
+                "url": rubric_resp.get("url"),
+                "body": slim_rb,
+            }
+        else:
+            out["rubric"] = rubric_resp
+        out["rubric_results"] = rubric_results_resp
+
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Schedule
 # ---------------------------------------------------------------------------
