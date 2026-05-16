@@ -10,8 +10,10 @@ school-specific.
 from __future__ import annotations
 
 import asyncio
+import html as _html
 import json as _json
 import os
+import re as _re
 from datetime import date, timedelta
 from typing import Any
 
@@ -324,81 +326,120 @@ def assignment_options() -> dict[str, Any]:
     return _get_client().request("GET", "/api/Assignment/ViewAssignmentOptions")
 
 
-_ASSIGNMENT_DETAIL_FIELDS = (
-    "AssignmentId",
-    "AssignmentIndexId",
-    "SectionId",
-    "GroupName",
-    "ShortDescription",
-    "AssignmentType",
-    "AssignmentDate",
-    "DueDate",
-    "MaxPoints",
-    "Factor",
-    "ExtraCredit",
-    "IncGradeBook",
-    "IncCumGrade",
-    "PublishGrade",
-    "DropboxInd",
-    "DropboxNumFiles",
-    "DropBoxResub",
-    "OnPaperSubmission",
-    "RubricInd",
-    "RubricId",
-    "ParentRubricId",
-    "AssessmentInd",
-    "DiscussionInd",
-    "FormativeInd",
-    "PartialInd",
-    "PastDue",
-    "CanResubmit",
-    "CourseEnded",
-    "GroupEndDate",
+# AssignmentStatusType enum, decoded from the lms-assignment SPA bundle.
+# -2147483648 is .NET int.MinValue and serves as a "not set" sentinel that
+# the SPA also treats as ToDo.
+_STATUS_TYPE_LABELS: dict[int, str] = {
+    -2147483648: "To do",
+    -1: "To do",
+    0: "In progress",
+    1: "Completed",
+    2: "Overdue",
+    3: "Retake",
+    4: "Graded",
+    6: "Paused",
+}
+
+
+def _status_label(t: Any) -> str | None:
+    if t is None:
+        return None
+    try:
+        return _STATUS_TYPE_LABELS.get(int(t))
+    except (TypeError, ValueError):
+        return None
+
+
+_HTML_BLOCK_TAGS = _re.compile(
+    r"</\s*(p|div|li|h[1-6]|tr|blockquote|pre)\s*>", _re.IGNORECASE
 )
-
-_ASSIGNMENT_GRADE_FIELDS = (
-    "Grade",
-    "GradedComment",
-    "AssignmentStatus",
-    "AssignmentStatusType",
-    "LastSubmitDate",
-    "DateDue",
-    "Late",
-    "Missing",
-    "Exempt",
-    "Incomplete",
-    "Collected",
-    "ReadyInd",
-    "DropBoxToDo",
-    "HasGrade",
-    "MessageCount",
+_HTML_BREAK_TAGS = _re.compile(r"<\s*br\s*/?\s*>", _re.IGNORECASE)
+_HTML_LIST_ITEM = _re.compile(r"<\s*li[^>]*>", _re.IGNORECASE)
+_HTML_LINK = _re.compile(
+    r'<\s*a\b[^>]*?href\s*=\s*"([^"]+)"[^>]*>(.*?)</\s*a\s*>',
+    _re.IGNORECASE | _re.DOTALL,
 )
+_HTML_TAG = _re.compile(r"<[^>]+>")
+_WS_RUN = _re.compile(r"[ \t]+")
+_NL_RUN = _re.compile(r"\n{3,}")
 
 
-def _slim_download(d: dict[str, Any]) -> dict[str, Any]:
+def _strip_html(s: Any) -> str | None:
+    """Turn the SPA's HTML descriptions into readable plain text."""
+    if not isinstance(s, str) or not s.strip():
+        return None
+    out = s
+    # Anchors → "label (url)" so the model still sees the destination.
+    out = _HTML_LINK.sub(lambda m: f"{m.group(2).strip()} ({m.group(1).strip()})", out)
+    out = _HTML_LIST_ITEM.sub("\n- ", out)
+    out = _HTML_BREAK_TAGS.sub("\n", out)
+    out = _HTML_BLOCK_TAGS.sub("\n\n", out)
+    out = _HTML_TAG.sub("", out)
+    out = _html.unescape(out)
+    out = _WS_RUN.sub(" ", out)
+    out = "\n".join(line.rstrip() for line in out.splitlines())
+    out = _NL_RUN.sub("\n\n", out).strip()
+    return out or None
+
+
+def _absolute_url(client: MyschoolappClient, url: Any) -> str | None:
+    if not isinstance(url, str) or not url:
+        return None
+    if url.startswith(("http://", "https://")):
+        return url
+    if url.startswith("/"):
+        return f"{client.base_url}{url}"
+    return f"{client.base_url}/{url}"
+
+
+def _format_range(low: Any, high: Any) -> str | None:
+    """Render a rubric level point range like '3.1-4' or just '4'."""
+    if low is None and high is None:
+        return None
+    if low is None:
+        return str(high)
+    if high is None or low == high:
+        return str(low)
+    return f"{low}-{high}"
+
+
+def _submission_method(body: dict[str, Any]) -> str | None:
+    if body.get("DropboxInd"):
+        return "dropbox"
+    if body.get("AssessmentInd"):
+        return "assessment"
+    if body.get("DiscussionInd"):
+        return "discussion"
+    if body.get("OnPaperSubmission"):
+        return "on_paper"
+    return None
+
+
+def _clean_download(client: MyschoolappClient, d: dict[str, Any]) -> dict[str, Any]:
     return {
-        k: d.get(k)
-        for k in ("FriendlyFileName", "ShortDescription", "DownloadUrl", "DownloadID")
-        if k in d
+        "name": d.get("FriendlyFileName") or d.get("ShortDescription"),
+        "url": _absolute_url(client, d.get("DownloadUrl")),
     }
 
 
-def _slim_submission(s: dict[str, Any]) -> dict[str, Any]:
+def _clean_link(client: MyschoolappClient, l: dict[str, Any]) -> dict[str, Any]:
     return {
-        k: s.get(k)
-        for k in (
-            "FileName",
-            "LastSubmitDate",
-            "DownloadUrl",
-            "DropBoxId",
-            "DropBoxFileId",
-            "Detail",
-            "ExternalId",
-            "GoogleExternalUrl",
-            "ReadyInd",
-        )
-        if k in s
+        "name": l.get("ShortDescription") or l.get("FriendlyFileName") or l.get("Url"),
+        "url": _absolute_url(client, l.get("Url") or l.get("DownloadUrl")),
     }
+
+
+def _clean_submission(client: MyschoolappClient, s: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "name": s.get("FileName"),
+        "submitted_at": s.get("LastSubmitDate"),
+        "url": _absolute_url(client, s.get("DownloadUrl")),
+    }
+    if s.get("GoogleExternalUrl"):
+        out["google_url"] = s["GoogleExternalUrl"]
+    if s.get("Detail"):
+        out["detail"] = s["Detail"]
+    return out
 
 
 @mcp.tool()
@@ -415,23 +456,24 @@ def assignment_detail(
     returned by `assignments()`. Use the AssignmentIndexId field from the
     assignments list, or grab it from the browser URL.
 
-    Returns the assignment description (HTML), due / assigned / submitted
-    dates, max points, downloadable handouts/templates (`DownloadItems`),
-    external links (`LinkItems`), the student's submitted files
-    (`SubmittedFiles` with DownloadUrl), and grade / status info (`Grade`).
+    Slim output (default) returns a flat snake_case structure:
+    - title, class, type, assigned, due, max_points, status, past_due
+    - description (HTML decoded to plain text)
+    - submission: {method, submitted, submitted_at, can_resubmit, files[]}
+    - resources: {downloads[], links[]} with absolute URLs
+    - grade / comment / late / missing / exempt / incomplete
 
     Set `include_rubric=True` to also fetch the rubric definition and any
-    per-criterion scores the teacher has assigned. Rubric results may be
-    empty if the assignment hasn't been graded yet.
+    per-criterion scores the teacher has assigned (results may be empty if
+    the assignment hasn't been graded yet).
 
-    Note: this tool is read-only. It does not upload submission files.
-    Submitting on a student's behalf is intentionally not implemented —
+    Note: this tool is read-only. It does not upload submission files —
     use the website for that.
 
     Args:
         assignment_index_id: The index id from the assignment URL.
         include_rubric: Also fetch the rubric definition + student results.
-        full: Return raw, untrimmed responses.
+        full: Return raw, untrimmed responses (large; for debugging).
     """
     client = _get_client()
     aid = str(assignment_index_id)
@@ -474,63 +516,114 @@ def assignment_detail(
     if not isinstance(body, dict):
         return {"detail": detail}
 
-    slim_body: dict[str, Any] = {
-        k: body.get(k) for k in _ASSIGNMENT_DETAIL_FIELDS if k in body
-    }
-    slim_body["LongDescription"] = body.get("LongDescription")
-    slim_body["DownloadItems"] = [
-        _slim_download(d) for d in (body.get("DownloadItems") or [])
-    ]
-    slim_body["LinkItems"] = body.get("LinkItems") or []
-    slim_body["SubmittedFiles"] = [
-        _slim_submission(s) for s in (body.get("SubmissionResults") or [])
-    ]
     grade = body.get("AssignmentGrade") or {}
-    slim_body["Grade"] = {
-        k: grade.get(k) for k in _ASSIGNMENT_GRADE_FIELDS if k in grade
+
+    cleaned: dict[str, Any] = {
+        "id": body.get("AssignmentIndexId"),
+        "assignment_id": body.get("AssignmentId"),
+        "section_id": body.get("SectionId"),
+        "url": (
+            f"{client.base_url}/lms-assignment/assignment/assignment-student-view/{aid}"
+        ),
+        "title": body.get("ShortDescription"),
+        "class": body.get("GroupName"),
+        "type": body.get("AssignmentType"),
+        "assigned": body.get("AssignmentDate"),
+        "due": body.get("DueDate") or grade.get("DateDue"),
+        "max_points": body.get("MaxPoints"),
+        "extra_credit": bool(body.get("ExtraCredit")),
+        "past_due": bool(body.get("PastDue")),
+        "course_ended": bool(body.get("CourseEnded")),
+        "status": _status_label(grade.get("AssignmentStatusType")),
+        "grade": grade.get("Grade") or None,
+        "comment": grade.get("GradedComment") or None,
+        "graded": bool(grade.get("HasGrade")),
+        "late": bool(grade.get("Late")),
+        "missing": bool(grade.get("Missing")),
+        "exempt": bool(grade.get("Exempt")),
+        "incomplete": bool(grade.get("Incomplete")),
+        "collected": bool(grade.get("Collected")),
+        "description": _strip_html(body.get("LongDescription")),
     }
 
-    out = {
-        "detail": {
-            "status": detail.get("status"),
-            "url": detail.get("url"),
-            "body": slim_body,
-        }
+    method = _submission_method(body)
+    submission_files = [
+        _clean_submission(client, s) for s in (body.get("SubmissionResults") or [])
+    ]
+    cleaned["submission"] = {
+        "method": method,
+        "max_files": body.get("DropboxNumFiles") if method == "dropbox" else None,
+        "submitted": bool(submission_files),
+        "submitted_at": grade.get("LastSubmitDate"),
+        "can_resubmit": bool(body.get("CanResubmit")),
+        "files": submission_files,
     }
+
+    cleaned["resources"] = {
+        "downloads": [
+            _clean_download(client, d) for d in (body.get("DownloadItems") or [])
+        ],
+        "links": [_clean_link(client, l) for l in (body.get("LinkItems") or [])],
+    }
+
+    out: dict[str, Any] = {"assignment": cleaned}
 
     if rubric_resp is not None:
         rb_body = rubric_resp.get("body") if isinstance(rubric_resp, dict) else None
+        results_body = (
+            rubric_results_resp.get("body")
+            if isinstance(rubric_results_resp, dict)
+            else None
+        )
+        rubric_out: dict[str, Any] = {}
         if isinstance(rb_body, dict):
-            slim_rb = {
-                "Name": rb_body.get("Name"),
-                "Description": rb_body.get("Description"),
-                "EvaluationType": rb_body.get("EvaluationType"),
-                "Skills": [
+            rubric_out = {
+                "id": rb_body.get("RubricId") or body.get("RubricId"),
+                "name": rb_body.get("Name"),
+                "description": _strip_html(rb_body.get("Description")),
+                "criteria": [
                     {
-                        "Name": skl.get("Name"),
-                        "SortOrder": skl.get("SortOrder"),
-                        "Levels": [
+                        "name": skl.get("Name"),
+                        "description": _strip_html(skl.get("Description")),
+                        "levels": [
                             {
-                                "Name": lv.get("Name"),
-                                "Description": lv.get("Description"),
-                                "Points": lv.get("Points"),
-                                "PointsTo": lv.get("PointsTo"),
-                                "SortOrder": lv.get("SortOrder"),
+                                "name": lv.get("Name"),
+                                "description": _strip_html(lv.get("Description")),
+                                "points": _format_range(
+                                    lv.get("Points"), lv.get("PointsTo")
+                                ),
                             }
-                            for lv in (skl.get("Levels") or [])
+                            for lv in sorted(
+                                (skl.get("Levels") or []),
+                                key=lambda x: x.get("SortOrder") or 0,
+                            )
                         ],
                     }
-                    for skl in (rb_body.get("Skills") or [])
+                    for skl in sorted(
+                        (rb_body.get("Skills") or []),
+                        key=lambda x: x.get("SortOrder") or 0,
+                    )
                 ],
             }
-            out["rubric"] = {
-                "status": rubric_resp.get("status"),
-                "url": rubric_resp.get("url"),
-                "body": slim_rb,
-            }
         else:
-            out["rubric"] = rubric_resp
-        out["rubric_results"] = rubric_results_resp
+            rubric_out = {"raw": rubric_resp}
+
+        if isinstance(results_body, list):
+            rubric_out["results"] = [
+                {
+                    "criterion": r.get("SkillName") or r.get("Name"),
+                    "level": r.get("LevelName"),
+                    "points": r.get("Points"),
+                    "comment": _strip_html(r.get("Comment")) or None,
+                }
+                for r in results_body
+            ]
+        elif isinstance(results_body, dict):
+            rubric_out["results"] = results_body
+        else:
+            rubric_out["results"] = []
+
+        out["rubric"] = rubric_out
 
     return out
 
