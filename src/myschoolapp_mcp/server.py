@@ -748,31 +748,149 @@ def classes(
     return resp
 
 
+def _fmt_pct(n: Any) -> str | None:
+    """Format a number like 85.39 as '85.39%'. Returns None for empty/zero."""
+    if n is None or n == "":
+        return None
+    try:
+        f = float(n)
+    except (TypeError, ValueError):
+        return None
+    # treat exact 0 as "no grade yet" rather than "0%"
+    if f == 0:
+        return None
+    return f"{f:.2f}%"
+
+
+def _to_float(n: Any) -> float | None:
+    if n is None or n == "":
+        return None
+    try:
+        f = float(n)
+    except (TypeError, ValueError):
+        return None
+    return f if f != 0 else None
+
+
 @mcp.tool()
-def gradebook(duration_id: int, section_ids: list[int]) -> dict[str, Any]:
-    """Get gradebook summary with marking-period grades for sections.
+def gradebook(
+    duration_id: int,
+    section_ids: list[int] | None = None,
+    full: bool = False,
+) -> dict[str, Any]:
+    """Get current-marking-period and year-to-date grades for each class.
+
+    Calls `ParentStudentUserClassesGet` to enumerate classes in the duration,
+    then `hydrategradebook` once per class to pull both the current
+    marking-period grade (`SectionGrade`) and the cumulative year-to-date
+    grade (`SectionGradeYear`).
 
     Args:
         duration_id: A DurationId from `student_terms()`.
-        section_ids: LeadSectionIds from `classes()`.
+        section_ids: Optional filter — only include these `leadsectionid`s.
+            Pass None / omit to include all classes in the duration.
+        full: True = also include the full per-section `hydrategradebook`
+            response (heavy — ~30 KB per class).
+
+    Returns body as a list of:
+        {
+          "section_id": int,             # leadsectionid
+          "class": str,
+          "teacher": str,
+          "marking_period": str,          # e.g. "3rd Trimester"
+          "marking_period_id": int,
+          "graded": bool,                 # False = free period, non-graded block
+          "current_grade": float | None,  # SectionGrade
+          "current_grade_display": str | None,    # "85.39%"
+          "year_grade": float | None,     # SectionGradeYear
+          "year_grade_display": str | None,       # "90.73%"
+        }
     """
-    duration_section_list = _json.dumps(
-        [
-            {
-                "DurationId": duration_id,
-                "LeadSectionList": [{"LeadSectionId": sid} for sid in section_ids],
-            }
-        ]
-    )
-    return _get_client().request(
+    client = _get_client()
+    student_id = _student_id()
+
+    classes_resp = client.request(
         "GET",
-        "/api/gradebook/GradeBookMyDayMarkingPeriods",
+        "/api/datadirect/ParentStudentUserClassesGet",
         params={
-            "durationSectionList": duration_section_list,
-            "userId": _student_id(),
-            "personaId": _persona_id(),
+            "userId": student_id,
+            "schoolYearLabel": _school_year(),
+            "memberLevel": 3,
+            "persona": _persona_id(),
+            "durationList": duration_id,
+            "markingPeriodId": "",
         },
     )
+    if not isinstance(classes_resp.get("body"), list):
+        return classes_resp
+
+    classes_list = classes_resp["body"]
+    if section_ids:
+        wanted = {int(s) for s in section_ids}
+        classes_list = [
+            c for c in classes_list if int(c.get("leadsectionid") or 0) in wanted
+        ]
+
+    out: list[dict[str, Any]] = []
+    for c in classes_list:
+        lead_section_id = c.get("leadsectionid")
+        marking_period_id = c.get("markingperiodid")
+        # Non-graded blocks (health/wellness, free periods, etc.) have no
+        # markingperiodid — not an error, just nothing to fetch.
+        is_graded = bool(lead_section_id and marking_period_id)
+        row: dict[str, Any] = {
+            "section_id": lead_section_id,
+            "class": c.get("sectionidentifier"),
+            "teacher": c.get("groupownername"),
+            "marking_period": c.get("currentterm"),
+            "marking_period_id": marking_period_id,
+            "graded": is_graded,
+            "current_grade": _to_float(c.get("cumgrade")),
+            "current_grade_display": _fmt_pct(c.get("cumgrade")),
+            "year_grade": None,
+            "year_grade_display": None,
+        }
+
+        if not is_graded:
+            out.append(row)
+            continue
+
+        hydra = client.request(
+            "GET",
+            "/api/gradebook/hydrategradebook",
+            params={
+                "sectionId": lead_section_id,
+                "markingPeriodId": marking_period_id,
+                "sortAssignmentId": "null",
+                "sortSkillPk": "null",
+                "sortDesc": "null",
+                "sortCumulative": "null",
+                "studentUserId": student_id,
+                "fromProgress": "true",
+            },
+        )
+        body = hydra.get("body")
+        if isinstance(body, dict):
+            roster = body.get("Roster") or []
+            if roster:
+                me = roster[0]
+                # SectionGrade from hydrategradebook is authoritative; fall back
+                # to cumgrade if it's zero/null.
+                sg = _to_float(me.get("SectionGrade"))
+                if sg is not None:
+                    row["current_grade"] = sg
+                    row["current_grade_display"] = _fmt_pct(sg)
+                row["year_grade"] = _to_float(me.get("SectionGradeYear"))
+                row["year_grade_display"] = _fmt_pct(me.get("SectionGradeYear"))
+        else:
+            row["error"] = f"hydrategradebook status {hydra.get('status')}"
+
+        if full:
+            row["hydrate"] = body
+
+        out.append(row)
+
+    return {"status": 200, "body": out}
 
 
 @mcp.tool()

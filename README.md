@@ -25,7 +25,8 @@ About 29 typed tools covering the common student/parent surfaces:
   (single assignment with downloads / submitted files / rubric),
   `assignment_options`, `assignment_status_labels`
 - **Schedule** — `schedule`, `daily_announcement`
-- **Academics** — `student_terms`, `classes`, `gradebook`,
+- **Academics** — `student_terms`, `classes`, `gradebook` (returns both
+  current marking-period and year-to-date grade per class),
   `report_card_templates`, `transcript_templates`, `attendance`,
   `conduct`, `grade_levels`
 - **Groups** — `group_membership` (advisory / athletic / dorm /

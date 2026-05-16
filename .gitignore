@@ -15,3 +15,6 @@ cookies.txt
 .idea/
 .pytest_cache/
 *.log
+
+# probe artifacts
+scripts/capture.jsonl
