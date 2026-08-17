@@ -1,4 +1,4 @@
-"""MCP server exposing myschoolapp.com via FastMCP.
+"""MCP server exposing myschoolapp.com via the MCP Python SDK.
 
 Endpoints were mapped by capturing live network traffic from a logged-in
 student session on Tabor Academy's myschoolapp deployment. They follow the
@@ -10,28 +10,58 @@ school-specific.
 from __future__ import annotations
 
 import asyncio
-import html as _html
-import json as _json
+import contextlib
 import os
-import re as _re
+import threading
 from datetime import date, timedelta
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
+from . import __version__
 from .client import MyschoolappClient, load_env_file
+from .formatting import (
+    ASSIGNMENT_BUCKETS,
+    DEFAULT_ASSIGNMENT_BUCKETS,
+    STATUS_TYPE_LABELS,
+    assignment_field,
+    clean_schedule_item,
+    compact_assignment,
+    compact_class,
+    compact_directory_entry,
+    due_bucket,
+    fmt_pct,
+    format_range,
+    mdy,
+    or_none,
+    parse_assignment_date,
+    status_label,
+    strip_html,
+    to_float,
+)
 
 _ENV_PATH = load_env_file()
 
-mcp = FastMCP("myschoolapp")
+mcp = MCPServer("myschoolapp", version=__version__)
 _client: MyschoolappClient | None = None
+_client_lock = threading.Lock()
 
 
 def _get_client() -> MyschoolappClient:
     global _client
-    if _client is None:
-        _client = MyschoolappClient()
-    return _client
+    with _client_lock:
+        if _client is None:
+            _client = MyschoolappClient()
+        return _client
+
+
+def _drop_client() -> None:
+    global _client
+    with _client_lock:
+        if _client is not None:
+            with contextlib.suppress(Exception):
+                _client.close()
+            _client = None
 
 
 def _student_id() -> str:
@@ -58,13 +88,6 @@ def _school_year() -> str:
     return f"{today.year - 1} - {today.year}"
 
 
-def _mdy(d: str | None) -> str:
-    if not d:
-        return ""
-    y, m, day = d.split("-")
-    return f"{int(m)}/{int(day)}/{y}"
-
-
 # ---------------------------------------------------------------------------
 # Core
 # ---------------------------------------------------------------------------
@@ -74,7 +97,8 @@ def _mdy(d: str | None) -> str:
 def whoami() -> dict[str, Any]:
     """Verify session cookie and return current user's profile tabs.
 
-    If this returns HTML or 401/403, the cookie is expired or wrong.
+    If this errors with an HTML body or 401/403, the cookie is expired or
+    wrong — run `cookie_refresh`.
     """
     return _get_client().request(
         "GET",
@@ -84,14 +108,16 @@ def whoami() -> dict[str, Any]:
 
 
 @mcp.tool()
-def config() -> dict[str, str]:
+def config() -> dict[str, Any]:
     """Show resolved config (subdomain, student id, persona, school year)."""
     client = _get_client()
     return {
         "subdomain": client.subdomain or "",
-        "student_id": _student_id(),
+        "student_id": os.environ.get("MSA_STUDENT_ID")
+        or "(unset — set MSA_STUDENT_ID; most tools will fail without it)",
         "persona_id": _persona_id(),
         "school_year": _school_year(),
+        "env_file": str(_ENV_PATH) if _ENV_PATH else None,
     }
 
 
@@ -115,21 +141,11 @@ async def cookie_refresh() -> dict[str, Any]:
     """
     from .auth import refresh_cookie
 
-    global _client
     # refresh_cookie() uses Playwright's sync API, which cannot run inside
-    # the asyncio event loop FastMCP runs us in. Offload to a worker thread.
-    try:
-        path = await asyncio.to_thread(refresh_cookie)
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-    if _client is not None:
-        try:
-            _client.close()
-        except Exception:
-            pass
-        _client = None
-
+    # the asyncio event loop the MCP server runs us in. Offload to a worker
+    # thread.
+    path = await asyncio.to_thread(refresh_cookie)
+    _drop_client()
     return {"ok": True, "cookie_path": str(path)}
 
 
@@ -138,137 +154,196 @@ async def cookie_refresh() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-_ASSIGNMENT_BUCKETS = (
-    "Missing",
-    "Overdue",
-    "DueToday",
-    "DueTomorrow",
-    "DueThisWeek",
-    "DueNextWeek",
-    "DueAfterNextWeek",
-    "PastThisWeek",
-    "PastLastWeek",
-    "PastBeforeLastWeek",
-)
-
-_DEFAULT_ASSIGNMENT_BUCKETS = (
-    "Missing",
-    "Overdue",
-    "DueToday",
-    "DueTomorrow",
-    "DueThisWeek",
-    "DueNextWeek",
-    "DueAfterNextWeek",
-    "PastThisWeek",
-    "PastLastWeek",
-)
-
-_ASSIGNMENT_ITEM_FIELDS = (
-    "AssignmentId",
-    "AssignmentIndexId",
-    "SectionId",
-    "GroupName",
-    "ShortDescription",
-    "AssignmentType",
-    "DateAssigned",
-    "DateDue",
-    "MaxPoints",
-    "StudentStatus",
-    "AssignmentStatus",
-    "MissingInd",
-    "LateInd",
-    "IncompleteInd",
-    "Major",
-    "ExtraCredit",
-    "MarkingPeriodDescription",
-    "MarkingPeriodId",
-    "HasGrade",
-    "DropBoxInd",
-    "DropBoxToDo",
-)
-
-
-def _compact_assignment(item: dict[str, Any]) -> dict[str, Any]:
-    return {k: item.get(k) for k in _ASSIGNMENT_ITEM_FIELDS if k in item}
-
-
 @mcp.tool()
 def assignments(
     display_by_due_date: bool = True,
     buckets: str = "",
     full: bool = False,
 ) -> dict[str, Any]:
-    """Get assignments grouped by due-date bucket.
+    """Get assignments grouped by due-date bucket (or by class).
+
+    Buckets are computed locally from the DataDirect date-range endpoint —
+    the same one the site's working legacy assignment view uses. (The
+    /api/assignment2/StudentAssignmentCenterGet endpoint this tool used to
+    call returns 403 for student sessions, even in a real browser.)
 
     Available buckets: Missing, Overdue, DueToday, DueTomorrow, DueThisWeek,
     DueNextWeek, DueAfterNextWeek, PastThisWeek, PastLastWeek,
-    PastBeforeLastWeek. PastBeforeLastWeek is excluded by default because it
-    typically contains hundreds of items.
+    PastBeforeLastWeek. Weeks run Monday-Sunday. PastBeforeLastWeek is
+    excluded by default because it can contain hundreds of items; requesting
+    it widens the fetch window to ~6 months back. Missing/Overdue come from
+    the server's missing/overdue filter; items flagged there are removed
+    from the date buckets so nothing is listed twice.
 
-    Each compact item includes GroupName (class), ShortDescription, DateDue,
-    DateAssigned, AssignmentType, MaxPoints, StudentStatus (decode with
-    `assignment_status_labels()`), MissingInd, LateInd, Major, ExtraCredit,
-    MarkingPeriodDescription, HasGrade.
+    Each compact item includes assignment_id, assignment_index_id (pass to
+    `assignment_detail`), section_id, class, title, type, assigned, due,
+    max_points, status (decode with `assignment_status_labels()`), missing,
+    late, incomplete, major, extra_credit, marking_period, has_grade, and
+    drop_box.
 
     Args:
-        display_by_due_date: True = group by due date (default).
-            False = group by class section.
+        display_by_due_date: True = group by due-date bucket (default).
+            False = group by class name instead (no Missing/Overdue merge).
         buckets: Comma-separated bucket names to include. Empty = default
             set (everything except PastBeforeLastWeek). Use "all" to include
-            every bucket.
-        full: True = return the raw, untrimmed response (large — likely to
-            exceed token limits).
+            every bucket. Unknown names raise ValueError in either mode.
+            When display_by_due_date is False this only controls how far
+            back the fetch window reaches (PastBeforeLastWeek widens it).
+        full: True = return the raw, untrimmed endpoint responses.
     """
-    resp = _get_client().request(
-        "GET",
-        "/api/assignment2/StudentAssignmentCenterGet",
-        params={"displayByDueDate": "true" if display_by_due_date else "false"},
-    )
-    if full or not isinstance(resp.get("body"), dict):
-        return resp
-
-    body = resp["body"]
     if not buckets:
-        wanted = set(_DEFAULT_ASSIGNMENT_BUCKETS)
+        wanted = set(DEFAULT_ASSIGNMENT_BUCKETS)
     elif buckets.strip().lower() == "all":
-        wanted = set(_ASSIGNMENT_BUCKETS)
+        wanted = set(ASSIGNMENT_BUCKETS)
     else:
         wanted = {b.strip() for b in buckets.split(",") if b.strip()}
+        unknown = wanted - set(ASSIGNMENT_BUCKETS)
+        if unknown:
+            raise ValueError(
+                f"Unknown bucket(s) {sorted(unknown)}. "
+                f"Valid: {', '.join(ASSIGNMENT_BUCKETS)} (or 'all')."
+            )
 
+    client = _get_client()
+    today = date.today()
+    days_back = 180 if "PastBeforeLastWeek" in wanted else 21
+    common = {
+        "format": "json",
+        "persona": _persona_id(),
+        "statusList": "",
+        "sectionList": "",
+    }
+    resp = client.request(
+        "GET",
+        "/api/DataDirect/AssignmentCenterAssignments/",
+        params={
+            **common,
+            "filter": 0,
+            "dateStart": mdy((today - timedelta(days=days_back)).isoformat()),
+            "dateEnd": mdy((today + timedelta(days=60)).isoformat()),
+        },
+    )
+
+    # Missing/overdue can predate the main window, so look back far. Only
+    # needed for the bucketed view (and raw dumps). A transport failure here
+    # must not throw away the already-successful range fetch — degrade to an
+    # error dict and let the soft-failure path below add a note.
+    flagged: dict[str, Any] | None = None
+    if full or display_by_due_date:
+        try:
+            flagged = client.request(
+                "GET",
+                "/api/DataDirect/AssignmentCenterAssignments/",
+                params={
+                    **common,
+                    "filter": 3,
+                    "dateStart": mdy((today - timedelta(days=180)).isoformat()),
+                    "dateEnd": mdy(today.isoformat()),
+                },
+            )
+        except RuntimeError as e:
+            flagged = {"error": True, "status": None, "message": str(e)}
+
+    if full:
+        return {"range": resp, "missing_overdue": flagged}
+    # Never dress an error up as an empty assignment list.
+    if resp.get("error") or not isinstance(resp.get("body"), list):
+        return resp
+
+    items = resp["body"]
     out_buckets: dict[str, list[dict[str, Any]]] = {}
     counts: dict[str, int] = {}
-    for name in _ASSIGNMENT_BUCKETS:
-        items = body.get(name) or []
-        counts[name] = len(items)
-        if name in wanted:
-            out_buckets[name] = [_compact_assignment(i) for i in items]
+    unbucketed: list[dict[str, Any]] = []
+    note: str | None = None
 
-    sections = [
-        {k: s.get(k) for k in ("LeadSectionId", "GroupName") if k in s}
-        for s in (body.get("Sections") or [])
-    ]
-    major = [_compact_assignment(i) for i in (body.get("MajorAssignments") or [])]
+    scan_items = items  # what sections/major_assignments are built from
+    if display_by_due_date:
+        assert flagged is not None
+        flagged_items: list[dict[str, Any]] = []
+        if flagged.get("error") or not isinstance(flagged.get("body"), list):
+            reason = flagged.get("message") or f"status {flagged.get('status')}"
+            note = (
+                f"missing/overdue fetch failed ({reason}); "
+                "Missing/Overdue buckets may be incomplete"
+            )
+        else:
+            flagged_items = flagged["body"]
+        flagged_ids = {
+            assignment_field(i, "assignment_index_id") for i in flagged_items
+        }
+        flagged_ids.discard(None)
+        # Flagged items can predate the range window, so include them when
+        # scanning for sections and major assignments too (dedup by index id
+        # mirrors the bucketing logic below).
+        scan_items = [
+            i
+            for i in items
+            if assignment_field(i, "assignment_index_id") not in flagged_ids
+        ] + flagged_items
 
-    return {
+        by_bucket: dict[str, list[dict[str, Any]]] = {
+            name: [] for name in ASSIGNMENT_BUCKETS
+        }
+        for item in items:
+            idx = assignment_field(item, "assignment_index_id")
+            if idx is not None and idx in flagged_ids:
+                continue  # listed under Missing/Overdue instead
+            due = parse_assignment_date(assignment_field(item, "due"))
+            if due is None:
+                unbucketed.append(compact_assignment(item))
+                continue
+            by_bucket[due_bucket(due, today)].append(compact_assignment(item))
+        for item in flagged_items:
+            name = "Missing" if assignment_field(item, "missing") else "Overdue"
+            by_bucket[name].append(compact_assignment(item))
+        for name in ASSIGNMENT_BUCKETS:
+            counts[name] = len(by_bucket[name])
+            if name in wanted:
+                out_buckets[name] = by_bucket[name]
+    else:
+        for item in items:
+            key = str(assignment_field(item, "class") or "Unknown class")
+            out_buckets.setdefault(key, []).append(compact_assignment(item))
+        counts = {k: len(v) for k, v in out_buckets.items()}
+
+    seen_sections: dict[Any, dict[str, Any]] = {}
+    major: list[dict[str, Any]] = []
+    for item in scan_items:
+        sec_id = assignment_field(item, "section_id")
+        if sec_id is not None and sec_id not in seen_sections:
+            seen_sections[sec_id] = {
+                "section_id": sec_id,
+                "class": assignment_field(item, "class"),
+            }
+        if assignment_field(item, "major"):
+            major.append(compact_assignment(item))
+
+    out = {
         "status": resp.get("status"),
         "url": resp.get("url"),
         "counts": counts,
         "buckets_included": sorted(out_buckets.keys()),
         "buckets": out_buckets,
-        "sections": sections,
+        "sections": list(seen_sections.values()),
         "major_assignments": major,
     }
+    if unbucketed:
+        out["unbucketed"] = unbucketed
+    if note:
+        out["note"] = note
+    return out
 
 
 @mcp.tool()
 def assignment_status_labels() -> dict[str, str]:
-    """Map StudentStatus codes returned by `assignments` to readable labels."""
-    return {
-        "1": "Completed",
-        "0": "In progress",
-        "2": "Overdue",
-        "-2147483648": "To do",
-    }
+    """Map `status` codes returned by `assignments` to readable labels.
+
+    Labels come from the AssignmentStatusType enum in the site's
+    lms-assignment SPA bundle. The DataDirect list endpoint appears to use
+    the same codes, but that mapping hasn't been verified on every
+    deployment — treat unfamiliar codes with mild suspicion.
+    """
+    return {str(k): v for k, v in STATUS_TYPE_LABELS.items()}
 
 
 @mcp.tool()
@@ -282,7 +357,8 @@ def assignments_in_range(
     """List assignments in a specific date range (legacy DataDirect endpoint).
 
     Use `assignments()` for the standard bucketed view; use this when you
-    need a custom date window.
+    need a custom date window. Note: data from previous school years is not
+    retained by the endpoint — old ranges return [].
 
     Args:
         date_start: YYYY-MM-DD. Defaults to today.
@@ -301,8 +377,8 @@ def assignments_in_range(
         params={
             "format": "json",
             "filter": filter_type,
-            "dateStart": _mdy(date_start),
-            "dateEnd": _mdy(date_end),
+            "dateStart": mdy(date_start),
+            "dateEnd": mdy(date_end),
             "persona": _persona_id(),
             "statusList": status_list,
             "sectionList": section_list,
@@ -326,62 +402,6 @@ def assignment_options() -> dict[str, Any]:
     return _get_client().request("GET", "/api/Assignment/ViewAssignmentOptions")
 
 
-# AssignmentStatusType enum, decoded from the lms-assignment SPA bundle.
-# -2147483648 is .NET int.MinValue and serves as a "not set" sentinel that
-# the SPA also treats as ToDo.
-_STATUS_TYPE_LABELS: dict[int, str] = {
-    -2147483648: "To do",
-    -1: "To do",
-    0: "In progress",
-    1: "Completed",
-    2: "Overdue",
-    3: "Retake",
-    4: "Graded",
-    6: "Paused",
-}
-
-
-def _status_label(t: Any) -> str | None:
-    if t is None:
-        return None
-    try:
-        return _STATUS_TYPE_LABELS.get(int(t))
-    except (TypeError, ValueError):
-        return None
-
-
-_HTML_BLOCK_TAGS = _re.compile(
-    r"</\s*(p|div|li|h[1-6]|tr|blockquote|pre)\s*>", _re.IGNORECASE
-)
-_HTML_BREAK_TAGS = _re.compile(r"<\s*br\s*/?\s*>", _re.IGNORECASE)
-_HTML_LIST_ITEM = _re.compile(r"<\s*li[^>]*>", _re.IGNORECASE)
-_HTML_LINK = _re.compile(
-    r'<\s*a\b[^>]*?href\s*=\s*"([^"]+)"[^>]*>(.*?)</\s*a\s*>',
-    _re.IGNORECASE | _re.DOTALL,
-)
-_HTML_TAG = _re.compile(r"<[^>]+>")
-_WS_RUN = _re.compile(r"[ \t]+")
-_NL_RUN = _re.compile(r"\n{3,}")
-
-
-def _strip_html(s: Any) -> str | None:
-    """Turn the SPA's HTML descriptions into readable plain text."""
-    if not isinstance(s, str) or not s.strip():
-        return None
-    out = s
-    # Anchors → "label (url)" so the model still sees the destination.
-    out = _HTML_LINK.sub(lambda m: f"{m.group(2).strip()} ({m.group(1).strip()})", out)
-    out = _HTML_LIST_ITEM.sub("\n- ", out)
-    out = _HTML_BREAK_TAGS.sub("\n", out)
-    out = _HTML_BLOCK_TAGS.sub("\n\n", out)
-    out = _HTML_TAG.sub("", out)
-    out = _html.unescape(out)
-    out = _WS_RUN.sub(" ", out)
-    out = "\n".join(line.rstrip() for line in out.splitlines())
-    out = _NL_RUN.sub("\n\n", out).strip()
-    return out or None
-
-
 def _absolute_url(client: MyschoolappClient, url: Any) -> str | None:
     if not isinstance(url, str) or not url:
         return None
@@ -390,17 +410,6 @@ def _absolute_url(client: MyschoolappClient, url: Any) -> str | None:
     if url.startswith("/"):
         return f"{client.base_url}{url}"
     return f"{client.base_url}/{url}"
-
-
-def _format_range(low: Any, high: Any) -> str | None:
-    """Render a rubric level point range like '3.1-4' or just '4'."""
-    if low is None and high is None:
-        return None
-    if low is None:
-        return str(high)
-    if high is None or low == high:
-        return str(low)
-    return f"{low}-{high}"
 
 
 def _submission_method(body: dict[str, Any]) -> str | None:
@@ -415,17 +424,13 @@ def _submission_method(body: dict[str, Any]) -> str | None:
     return None
 
 
-def _clean_download(client: MyschoolappClient, d: dict[str, Any]) -> dict[str, Any]:
+def _clean_resource(client: MyschoolappClient, item: dict[str, Any]) -> dict[str, Any]:
+    """Compact a DownloadItems / LinkItems entry to {name, url}."""
     return {
-        "name": d.get("FriendlyFileName") or d.get("ShortDescription"),
-        "url": _absolute_url(client, d.get("DownloadUrl")),
-    }
-
-
-def _clean_link(client: MyschoolappClient, l: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "name": l.get("ShortDescription") or l.get("FriendlyFileName") or l.get("Url"),
-        "url": _absolute_url(client, l.get("Url") or l.get("DownloadUrl")),
+        "name": item.get("FriendlyFileName")
+        or item.get("ShortDescription")
+        or item.get("Url"),
+        "url": _absolute_url(client, item.get("DownloadUrl") or item.get("Url")),
     }
 
 
@@ -452,9 +457,9 @@ def assignment_detail(
 
     The `assignment_index_id` is the number at the end of the assignment URL,
     e.g. `/lms-assignment/assignment/assignment-student-view/41609904` →
-    `41609904`. This is the per-student index id, NOT the global AssignmentId
-    returned by `assignments()`. Use the AssignmentIndexId field from the
-    assignments list, or grab it from the browser URL.
+    `41609904`. This is the per-student index id, NOT the global
+    assignment_id. Use the assignment_index_id field from the
+    `assignments()` list, or grab it from the browser URL.
 
     Slim output (default) returns a flat snake_case structure:
     - title, class, type, assigned, due, max_points, status, past_due
@@ -534,16 +539,17 @@ def assignment_detail(
         "extra_credit": bool(body.get("ExtraCredit")),
         "past_due": bool(body.get("PastDue")),
         "course_ended": bool(body.get("CourseEnded")),
-        "status": _status_label(grade.get("AssignmentStatusType")),
-        "grade": grade.get("Grade") or None,
-        "comment": grade.get("GradedComment") or None,
+        "status": status_label(grade.get("AssignmentStatusType")),
+        # or_none, not `or`: a real 0 score must survive.
+        "grade": or_none(grade.get("Grade")),
+        "comment": or_none(grade.get("GradedComment")),
         "graded": bool(grade.get("HasGrade")),
         "late": bool(grade.get("Late")),
         "missing": bool(grade.get("Missing")),
         "exempt": bool(grade.get("Exempt")),
         "incomplete": bool(grade.get("Incomplete")),
         "collected": bool(grade.get("Collected")),
-        "description": _strip_html(body.get("LongDescription")),
+        "description": strip_html(body.get("LongDescription")),
     }
 
     method = _submission_method(body)
@@ -561,12 +567,14 @@ def assignment_detail(
 
     cleaned["resources"] = {
         "downloads": [
-            _clean_download(client, d) for d in (body.get("DownloadItems") or [])
+            _clean_resource(client, d) for d in (body.get("DownloadItems") or [])
         ],
-        "links": [_clean_link(client, l) for l in (body.get("LinkItems") or [])],
+        "links": [
+            _clean_resource(client, link) for link in (body.get("LinkItems") or [])
+        ],
     }
 
-    out: dict[str, Any] = {"assignment": cleaned}
+    out = {"assignment": cleaned}
 
     if rubric_resp is not None:
         rb_body = rubric_resp.get("body") if isinstance(rubric_resp, dict) else None
@@ -580,16 +588,16 @@ def assignment_detail(
             rubric_out = {
                 "id": rb_body.get("RubricId") or body.get("RubricId"),
                 "name": rb_body.get("Name"),
-                "description": _strip_html(rb_body.get("Description")),
+                "description": strip_html(rb_body.get("Description")),
                 "criteria": [
                     {
                         "name": skl.get("Name"),
-                        "description": _strip_html(skl.get("Description")),
+                        "description": strip_html(skl.get("Description")),
                         "levels": [
                             {
                                 "name": lv.get("Name"),
-                                "description": _strip_html(lv.get("Description")),
-                                "points": _format_range(
+                                "description": strip_html(lv.get("Description")),
+                                "points": format_range(
                                     lv.get("Points"), lv.get("PointsTo")
                                 ),
                             }
@@ -614,7 +622,7 @@ def assignment_detail(
                     "criterion": r.get("SkillName") or r.get("Name"),
                     "level": r.get("LevelName"),
                     "points": r.get("Points"),
-                    "comment": _strip_html(r.get("Comment")) or None,
+                    "comment": strip_html(r.get("Comment")) or None,
                 }
                 for r in results_body
             ]
@@ -634,17 +642,27 @@ def assignment_detail(
 
 
 @mcp.tool()
-def schedule(on_date: str | None = None) -> dict[str, Any]:
-    """Get the day's class schedule.
+def schedule(on_date: str | None = None, full: bool = False) -> dict[str, Any]:
+    """Get the day's schedule: classes, athletics, and other blocks.
+
+    Compact items (default): class, block, start, end, room, building,
+    teacher, teacher_email, section_id, attendance ("Attended" / "--" /
+    "N/A"), plus type / opponent / home_away for athletics and
+    canceled / rescheduled flags when set.
 
     Args:
         on_date: YYYY-MM-DD. Empty/None = today.
+        full: True = raw endpoint response (~50 mostly-empty fields per item).
     """
-    return _get_client().request(
+    resp = _get_client().request(
         "GET",
         "/api/schedule/MyDayCalendarStudentList/",
-        params={"scheduleDate": _mdy(on_date), "personaId": _persona_id()},
+        params={"scheduleDate": mdy(on_date), "personaId": _persona_id()},
     )
+    if full or resp.get("error") or not isinstance(resp.get("body"), list):
+        return resp
+    resp["body"] = [clean_schedule_item(i) for i in resp["body"]]
+    return resp
 
 
 @mcp.tool()
@@ -658,7 +676,7 @@ def daily_announcement(on_date: str | None = None) -> dict[str, Any]:
         "GET",
         "/api/schedule/ScheduleCurrentDayAnnouncmentParentStudent/",
         params={
-            "mydayDate": _mdy(on_date),
+            "mydayDate": mdy(on_date),
             "viewerId": _student_id(),
             "viewerPersonaId": _persona_id(),
         },
@@ -672,10 +690,14 @@ def daily_announcement(on_date: str | None = None) -> dict[str, Any]:
 
 @mcp.tool()
 def student_terms() -> dict[str, Any]:
-    """List academic groups and their terms (durations) for the school year.
+    """List the student's terms (durations) for the school year.
 
-    The response contains DurationId values needed by `classes`, `gradebook`,
-    `group_membership`, etc.
+    Each row has DurationId + DurationDescription (e.g. "Year Long",
+    "Fall Season"), OfferingType (3 = academics, 9 = athletics/afternoon
+    program, 11 = continuous/community groups), and CurrentInd (1 = term is
+    currently active). DurationId values feed `classes`, `gradebook`, and
+    `group_membership` — though those tools auto-resolve the current
+    academic duration if you don't pass one.
     """
     return _get_client().request(
         "GET",
@@ -688,47 +710,40 @@ def student_terms() -> dict[str, Any]:
     )
 
 
-_CLASS_FIELDS = (
-    "sectionid",
-    "leadsectionid",
-    "sectionidentifier",
-    "room",
-    "currentterm",
-    "DurationId",
-    "markingperiodid",
-    "groupownername",
-    "groupowneremail",
-    "OwnerId",
-    "cumgrade",
-    "CumulativeDisplay",
-    "OverdueCount",
-    "UpcomingCount",
-    "assignmentactivetoday",
-    "assignmentduetoday",
-    "assignmentassignedtoday",
-    "canviewassignments",
-    "publishgrouptouser",
-    "AttendanceTaken",
-)
-
-
-@mcp.tool()
-def classes(
-    duration_id: int, marking_period_id: str = "", full: bool = False
-) -> dict[str, Any]:
-    """List classes for a given term (duration).
-
-    By default returns a compact view with the section info, teacher, room,
-    cumulative grade, and assignment counts. Course descriptions, photos,
-    and other heavy fields are stripped — set ``full=True`` to keep them.
-
-    Args:
-        duration_id: A DurationId from `student_terms()`.
-        marking_period_id: Optional marking-period filter.
-        full: True = return the raw, untrimmed response (large; includes
-            HTML course descriptions).
-    """
+def _resolve_duration_id() -> int:
+    """Pick the current academic DurationId from StudentGroupTermList."""
     resp = _get_client().request(
+        "GET",
+        "/api/DataDirect/StudentGroupTermList/",
+        params={
+            "studentUserId": _student_id(),
+            "schoolYearLabel": _school_year(),
+            "personaId": _persona_id(),
+        },
+    )
+    body = resp.get("body")
+    if resp.get("error") or not isinstance(body, list):
+        raise RuntimeError(
+            f"Could not auto-resolve duration_id (status {resp.get('status')}). "
+            "Pass duration_id explicitly — see student_terms()."
+        )
+    current = [
+        t
+        for t in body
+        if isinstance(t, dict) and t.get("CurrentInd") and t.get("DurationId")
+    ]
+    if not current:
+        raise RuntimeError(
+            "No currently-active term with a DurationId found. "
+            "Pass duration_id explicitly — see student_terms()."
+        )
+    # OfferingType 3 = academics (observed); athletics is 9, community 11.
+    academic = [t for t in current if t.get("OfferingType") == 3]
+    return int((academic or current)[0]["DurationId"])
+
+
+def _fetch_classes(duration_id: int, marking_period_id: str = "") -> dict[str, Any]:
+    return _get_client().request(
         "GET",
         "/api/datadirect/ParentStudentUserClassesGet",
         params={
@@ -740,41 +755,39 @@ def classes(
             "markingPeriodId": marking_period_id,
         },
     )
-    if full or not isinstance(resp.get("body"), list):
+
+
+@mcp.tool()
+def classes(
+    duration_id: int = 0, marking_period_id: str = "", full: bool = False
+) -> dict[str, Any]:
+    """List classes for a term (duration).
+
+    By default returns a compact snake_case view per class: section ids,
+    class name, teacher (+email), room, current term, current grade, and
+    assignment counts. Course descriptions, photos, and other heavy fields
+    are stripped — set ``full=True`` to keep them.
+
+    Args:
+        duration_id: A DurationId from `student_terms()`. 0 / omitted =
+            auto-resolve the current academic term.
+        marking_period_id: Optional marking-period filter.
+        full: True = return the raw, untrimmed response (large; includes
+            HTML course descriptions).
+    """
+    if not duration_id:
+        duration_id = _resolve_duration_id()
+    resp = _fetch_classes(duration_id, marking_period_id)
+    if full or resp.get("error") or not isinstance(resp.get("body"), list):
         return resp
-    resp["body"] = [
-        {k: c.get(k) for k in _CLASS_FIELDS if k in c} for c in resp["body"]
-    ]
+    resp["body"] = [compact_class(c) for c in resp["body"]]
+    resp["duration_id"] = duration_id
     return resp
-
-
-def _fmt_pct(n: Any) -> str | None:
-    """Format a number like 85.39 as '85.39%'. Returns None for empty/zero."""
-    if n is None or n == "":
-        return None
-    try:
-        f = float(n)
-    except (TypeError, ValueError):
-        return None
-    # treat exact 0 as "no grade yet" rather than "0%"
-    if f == 0:
-        return None
-    return f"{f:.2f}%"
-
-
-def _to_float(n: Any) -> float | None:
-    if n is None or n == "":
-        return None
-    try:
-        f = float(n)
-    except (TypeError, ValueError):
-        return None
-    return f if f != 0 else None
 
 
 @mcp.tool()
 def gradebook(
-    duration_id: int,
+    duration_id: int = 0,
     section_ids: list[int] | None = None,
     full: bool = False,
 ) -> dict[str, Any]:
@@ -786,15 +799,16 @@ def gradebook(
     grade (`SectionGradeYear`).
 
     Args:
-        duration_id: A DurationId from `student_terms()`.
-        section_ids: Optional filter — only include these `leadsectionid`s.
+        duration_id: A DurationId from `student_terms()`. 0 / omitted =
+            auto-resolve the current academic term.
+        section_ids: Optional filter — only include these `lead_section_id`s.
             Pass None / omit to include all classes in the duration.
         full: True = also include the full per-section `hydrategradebook`
             response (heavy — ~30 KB per class).
 
     Returns body as a list of:
         {
-          "section_id": int,             # leadsectionid
+          "section_id": int,             # lead section id
           "class": str,
           "teacher": str,
           "marking_period": str,          # e.g. "3rd Trimester"
@@ -808,20 +822,11 @@ def gradebook(
     """
     client = _get_client()
     student_id = _student_id()
+    if not duration_id:
+        duration_id = _resolve_duration_id()
 
-    classes_resp = client.request(
-        "GET",
-        "/api/datadirect/ParentStudentUserClassesGet",
-        params={
-            "userId": student_id,
-            "schoolYearLabel": _school_year(),
-            "memberLevel": 3,
-            "persona": _persona_id(),
-            "durationList": duration_id,
-            "markingPeriodId": "",
-        },
-    )
-    if not isinstance(classes_resp.get("body"), list):
+    classes_resp = _fetch_classes(duration_id)
+    if classes_resp.get("error") or not isinstance(classes_resp.get("body"), list):
         return classes_resp
 
     classes_list = classes_resp["body"]
@@ -845,8 +850,8 @@ def gradebook(
             "marking_period": c.get("currentterm"),
             "marking_period_id": marking_period_id,
             "graded": is_graded,
-            "current_grade": _to_float(c.get("cumgrade")),
-            "current_grade_display": _fmt_pct(c.get("cumgrade")),
+            "current_grade": to_float(c.get("cumgrade")),
+            "current_grade_display": fmt_pct(c.get("cumgrade")),
             "year_grade": None,
             "year_grade_display": None,
         }
@@ -872,16 +877,27 @@ def gradebook(
         body = hydra.get("body")
         if isinstance(body, dict):
             roster = body.get("Roster") or []
-            if roster:
+            me = next(
+                (
+                    r
+                    for r in roster
+                    if str(r.get("StudentUserId") or "") == str(student_id)
+                ),
+                None,
+            )
+            if me is None and len(roster) == 1:
                 me = roster[0]
-                # SectionGrade from hydrategradebook is authoritative; fall back
-                # to cumgrade if it's zero/null.
-                sg = _to_float(me.get("SectionGrade"))
+            if me is not None:
+                # SectionGrade from hydrategradebook is authoritative; fall
+                # back to cumgrade if it's zero/null.
+                sg = to_float(me.get("SectionGrade"))
                 if sg is not None:
                     row["current_grade"] = sg
-                    row["current_grade_display"] = _fmt_pct(sg)
-                row["year_grade"] = _to_float(me.get("SectionGradeYear"))
-                row["year_grade_display"] = _fmt_pct(me.get("SectionGradeYear"))
+                    row["current_grade_display"] = fmt_pct(sg)
+                row["year_grade"] = to_float(me.get("SectionGradeYear"))
+                row["year_grade_display"] = fmt_pct(me.get("SectionGradeYear"))
+            elif roster:
+                row["error"] = "student not found in gradebook roster"
         else:
             row["error"] = f"hydrategradebook status {hydra.get('status')}"
 
@@ -890,7 +906,7 @@ def gradebook(
 
         out.append(row)
 
-    return {"status": 200, "body": out}
+    return {"status": 200, "duration_id": duration_id, "body": out}
 
 
 @mcp.tool()
@@ -976,10 +992,9 @@ def group_membership(kind: str, duration_id: int = 0) -> dict[str, Any]:
             (school-wide).
     """
     if kind not in _GROUP_ENDPOINTS:
-        return {
-            "error": True,
-            "message": f"Unknown kind '{kind}'. Valid: {sorted(_GROUP_ENDPOINTS)}",
-        }
+        raise ValueError(
+            f"Unknown kind '{kind}'. Valid: {', '.join(sorted(_GROUP_ENDPOINTS))}."
+        )
     endpoint, dur_param = _GROUP_ENDPOINTS[kind]
     return _get_client().request(
         "GET",
@@ -1006,7 +1021,14 @@ def calendar_list(
     calendar_set_id: int = 1,
     settings_type_id: int = 1,
 ) -> dict[str, Any]:
-    """List calendar items in a date range.
+    """List the user's calendar *definitions* (not events).
+
+    Despite taking a date range, this endpoint returns the set of calendars
+    visible to the user (Assignments, Schedule, Games/Practices, school
+    calendars, ...) with their colors and per-group Filters[] — it's what
+    the SPA uses to draw the calendar sidebar. Use `schedule` /
+    `assignments` for actual day-to-day items, or `api_request` against
+    other /api/mycalendar/ endpoints for raw events.
 
     Args:
         date_start: YYYY-MM-DD.
@@ -1018,8 +1040,8 @@ def calendar_list(
         "GET",
         "/api/mycalendar/list/",
         params={
-            "startDate": _mdy(date_start),
-            "endDate": _mdy(date_end),
+            "startDate": mdy(date_start),
+            "endDate": mdy(date_end),
             "settingsTypeId": settings_type_id,
             "calendarSetId": calendar_set_id,
             "recentFilterSave": "false",
@@ -1054,7 +1076,9 @@ def official_notes(
 
     Args:
         to_date: Latest date YYYY-MM-DD. Defaults to today.
-        category_id: Note category id (school-specific; 22 observed default).
+        category_id: Note category id. School-specific — 22 is the value
+            observed on the deployment this server was built against; find
+            yours in DevTools on the site's Notes/Inbox page.
         current_only: 1 for current, 0 for archived.
         sort_by: Sort key.
         search_text: Free-text search.
@@ -1070,7 +1094,7 @@ def official_notes(
             "statusXml": "",
             "commentTypeXml": "",
             "fromDate": "",
-            "toDate": _mdy(to_date),
+            "toDate": mdy(to_date),
             "searchText": search_text,
             "studentUserId": "",
             "categoryId": category_id,
@@ -1082,7 +1106,7 @@ def official_notes(
 
 @mcp.tool()
 def official_note_types(category_id: int = 22) -> dict[str, Any]:
-    """List available note types for a category."""
+    """List available note types for a category (see `official_notes`)."""
     return _get_client().request(
         "GET",
         "/api/datadirect/OfficialNoteTypeGet/",
@@ -1121,16 +1145,28 @@ def directory_search(
     query: str = "",
     facets: str = "",
     search_all: bool = False,
+    limit: int = 25,
+    full: bool = False,
 ) -> dict[str, Any]:
-    """Search a directory.
+    """Search a school directory.
+
+    Results are compacted (user_id, name, email, phone, job_title,
+    department, grad_year, grade, is_student) and capped at `limit` — an
+    empty query makes the raw endpoint return the *entire* directory, which
+    can be hundreds of entries / 100+ KB. The response includes
+    `total_results` so you can tell when the cap kicked in.
 
     Args:
-        directory_id: Numeric directory id (e.g. 397 for Faculty/Staff at Tabor).
+        directory_id: Numeric directory id (school-specific; e.g. 397 =
+            Faculty/Staff on the deployment this was built against). Find
+            yours via `directory_info` / DevTools.
         query: Free-text search.
         facets: Encoded facet filter from `directory_facets()`.
         search_all: Match across all facets.
+        limit: Max results to return (default 25).
+        full: True = raw, uncapped endpoint response (can be huge).
     """
-    return _get_client().request(
+    resp = _get_client().request(
         "GET",
         "/api/directory/directoryresultsget",
         params={
@@ -1140,6 +1176,15 @@ def directory_search(
             "searchAll": "true" if search_all else "false",
         },
     )
+    if full or resp.get("error") or not isinstance(resp.get("body"), list):
+        return resp
+    rows = resp["body"]
+    limit = max(1, limit)
+    resp["body"] = [compact_directory_entry(r) for r in rows[:limit]]
+    resp["total_results"] = len(rows)
+    if len(rows) > limit:
+        resp["truncated_to"] = limit
+    return resp
 
 
 @mcp.tool()
@@ -1180,6 +1225,9 @@ def api_request(
 
     Use for anything not covered by a typed tool. Discover endpoints with
     DevTools > Network tab while using the site in a browser.
+
+    Requests are pinned to the school's own host — absolute URLs pointing
+    anywhere else are rejected so the session cookie can't leak.
 
     Args:
         method: HTTP method.

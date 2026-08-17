@@ -24,9 +24,12 @@ About 29 typed tools covering the common student/parent surfaces:
   `assignments_in_range`, `missing_assignments`, `assignment_detail`
   (single assignment with downloads / submitted files / rubric),
   `assignment_options`, `assignment_status_labels`
-- **Schedule** — `schedule`, `daily_announcement`
-- **Academics** — `student_terms`, `classes`, `gradebook` (returns both
-  current marking-period and year-to-date grade per class),
+- **Schedule** — `schedule` (compact per-block view by default),
+  `daily_announcement`
+- **Academics** — `student_terms`, `classes`, `gradebook` (both return
+  compact per-class views and auto-resolve the current academic term if
+  you don't pass a `duration_id`; gradebook returns both the current
+  marking-period and year-to-date grade per class),
   `report_card_templates`, `transcript_templates`, `attendance`,
   `conduct`, `grade_levels`
 - **Groups** — `group_membership` (advisory / athletic / dorm /
@@ -34,9 +37,12 @@ About 29 typed tools covering the common student/parent surfaces:
 - **Calendar** — `calendar_list`, `calendar_actions`
 - **Inbox / news** — `official_notes`, `official_note_types`,
   `activity_feed`
-- **Directory** — `directory_search`, `directory_info`,
-  `directory_facets`
-- **Escape hatch** — `api_request` for anything else
+- **Directory** — `directory_search` (compact rows, capped at a `limit`
+  so an empty query can't dump the whole school into your context),
+  `directory_info`, `directory_facets`
+- **Escape hatch** — `api_request` for anything else. Requests are
+  pinned to your school's own host — absolute URLs pointing anywhere
+  else are rejected so the session cookie can't leak.
 
 ## Install
 
@@ -100,6 +106,11 @@ If 2FA is on, log in to the site in a normal browser, export your
 cookies with any standard cookie-export extension, and point
 `MSA_COOKIES_FILE` at the result.
 
+**Security note:** the cookie file is a full session credential and
+`.env` contains your actual password. The refresh script writes
+`cookie.txt` with `0600` permissions (and the containing directory
+`0700`); if you create either file by hand, `chmod 600` it yourself.
+
 ## Register with an MCP client
 
 ### Claude Code
@@ -141,6 +152,10 @@ an unrelated working directory, copy your `.env` to
 - Some tools return school-specific IDs (`categoryId` for official
   notes, `directoryId` for directories). The defaults in this repo
   match Tabor Academy; yours may differ. Open DevTools and check.
+- `calendar_list` returns the user's calendar *definitions* (names,
+  colors, filters) — not events, despite taking a date range. That's
+  what the underlying endpoint actually does. Use `schedule` /
+  `assignments` for day-to-day items.
 - The `assignments` and `classes` tools strip heavy fields (HTML course
   descriptions, photo metadata, the full historical assignment bucket)
   by default to stay within token budgets. Pass `full=True` for the raw
@@ -151,6 +166,20 @@ an unrelated working directory, copy your `.env` to
 - Read-only by design. The tools that exist all map to GET endpoints.
   Use `api_request` if you want to POST something, but consider whether
   you really want an LLM submitting forms on your behalf.
+
+## Development
+
+```bash
+pip install -e '.[dev]'
+ruff check src tests
+pytest
+```
+
+The tests cover the pure formatting/parsing helpers and the client's
+cookie parsing and URL gating — no live session needed.
+`scripts/probe_api.py` opens a headed browser and streams every `/api/`
+request the SPA makes to `scripts/capture.jsonl`; that's how these
+endpoints were mapped in the first place.
 
 ## Credits
 

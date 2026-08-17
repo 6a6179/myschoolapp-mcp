@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
+
+_EXPIRED_COOKIE_HINT = (
+    "Got an HTML page instead of JSON — the session cookie is probably "
+    "expired or invalid. Run the cookie_refresh tool (or "
+    "`myschoolapp-mcp-refresh`) and retry."
+)
 
 
 class MyschoolappClient:
@@ -24,12 +32,19 @@ class MyschoolappClient:
                 "for myschool.myschoolapp.com)."
             )
         self.base_url = f"https://{self.subdomain}.myschoolapp.com"
+        self._host = f"{self.subdomain}.myschoolapp.com".lower()
 
         cookie_dict = _load_cookies(cookies)
 
+        # Scope every cookie to the school host. A plain dict jar in httpx
+        # is domain-unscoped and would happily be sent to any absolute URL.
+        jar = httpx.Cookies()
+        for name, value in cookie_dict.items():
+            jar.set(name, value, domain=self._host)
+
         self._client = httpx.Client(
             base_url=self.base_url,
-            cookies=cookie_dict,
+            cookies=jar,
             headers={
                 "Accept": "application/json, text/plain, */*",
                 "Accept-Language": "en-US,en;q=0.9",
@@ -45,6 +60,9 @@ class MyschoolappClient:
             follow_redirects=True,
         )
 
+    def _resolve_path(self, path: str) -> str:
+        return resolve_request_path(path, self._host)
+
     def request(
         self,
         method: str,
@@ -54,17 +72,21 @@ class MyschoolappClient:
         data: dict[str, Any] | None = None,
         extra_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        if not path.startswith("/") and not path.startswith("http"):
-            path = "/" + path
+        path = self._resolve_path(path)
 
-        resp = self._client.request(
-            method.upper(),
-            path,
-            params=params,
-            json=json_body,
-            data=data,
-            headers=extra_headers,
-        )
+        try:
+            resp = self._client.request(
+                method.upper(),
+                path,
+                params=params,
+                json=json_body,
+                data=data,
+                headers=extra_headers,
+            )
+        except httpx.HTTPError as e:
+            raise RuntimeError(
+                f"Request to {path} failed: {type(e).__name__}: {e}"
+            ) from e
 
         out: dict[str, Any] = {
             "status": resp.status_code,
@@ -76,9 +98,20 @@ class MyschoolappClient:
                 out["body"] = resp.json()
             except json.JSONDecodeError:
                 out["body"] = resp.text[:50_000]
+                out["error"] = True
+                out["message"] = "Response claimed to be JSON but failed to parse."
         else:
             text = resp.text
-            if len(text) > 50_000:
+            head = text[:300].lstrip().lower()
+            is_html = "text/html" in ct or head.startswith(("<!doctype", "<html"))
+            if is_html and resp.status_code < 400:
+                # A 200 HTML page from an /api/ endpoint means we got bounced
+                # to the login page: the session is dead. Don't bury that in
+                # 50 KB of markup.
+                out["body"] = text[:2_000]
+                out["error"] = True
+                out["hint"] = _EXPIRED_COOKIE_HINT
+            elif len(text) > 50_000:
                 out["body"] = text[:50_000]
                 out["truncated"] = True
             else:
@@ -92,6 +125,30 @@ class MyschoolappClient:
         self._client.close()
 
 
+def resolve_request_path(path: str, allowed_host: str) -> str:
+    """Normalize a request path, refusing to leak the session off-site.
+
+    Relative paths pass through (with a leading slash added). Absolute and
+    protocol-relative URLs are only allowed when they point at the school's
+    own host over https — anything else (other hosts, plain http) would
+    expose the session cookie.
+    """
+    path = path.strip()
+    parts = urlsplit(path)
+    if parts.scheme or parts.netloc:
+        if parts.scheme not in ("", "https") or (
+            parts.netloc.lower() != allowed_host
+        ):
+            raise ValueError(
+                f"Refusing to send the session cookie to {path!r}: only "
+                f"https://{allowed_host} is allowed. Use a path like '/api/...'."
+            )
+        return path
+    if not path.startswith("/"):
+        return "/" + path
+    return path
+
+
 def default_cookie_path() -> Path:
     """Default location for the cookie file produced by the refresh script."""
     return Path.home() / ".myschoolapp-mcp" / "cookie.txt"
@@ -101,8 +158,9 @@ def load_env_file() -> Path | None:
     """Find and load .env from several reasonable locations.
 
     Order: $MSA_ENV_FILE, cwd, ~/.myschoolapp-mcp/.env, then walk up from
-    this file's location until we find a .env or the project root (the
-    nearest directory containing pyproject.toml).
+    this file's location looking for a project root (a directory containing
+    pyproject.toml). The walk is capped at a few levels so a pip-installed
+    package doesn't scan all the way to /.
 
     Returns the loaded path, or None if python-dotenv is unavailable or no
     .env file was found.
@@ -116,13 +174,11 @@ def load_env_file() -> Path | None:
     override = os.environ.get("MSA_ENV_FILE")
     if override:
         candidates.append(Path(override))
-    try:
+    with contextlib.suppress(OSError):
         candidates.append(Path.cwd() / ".env")
-    except (FileNotFoundError, OSError):
-        pass
     candidates.append(Path.home() / ".myschoolapp-mcp" / ".env")
     here = Path(__file__).resolve()
-    for parent in here.parents:
+    for parent in list(here.parents)[:4]:
         candidates.append(parent / ".env")
         if (parent / "pyproject.toml").exists():
             break
@@ -142,11 +198,17 @@ def _load_cookies(cookies: dict[str, str] | str | None) -> dict[str, str]:
     if isinstance(cookies, dict):
         return cookies
     if isinstance(cookies, str):
-        return _parse_cookie_header(cookies)
+        parsed = _parse_cookie_header(cookies)
+        if not parsed:
+            raise RuntimeError("Cookie string contained no name=value pairs.")
+        return parsed
 
     raw = os.environ.get("MSA_COOKIE")
     if raw:
-        return _parse_cookie_header(raw)
+        parsed = _parse_cookie_header(raw)
+        if not parsed:
+            raise RuntimeError("MSA_COOKIE contained no name=value pairs.")
+        return parsed
 
     path_str = os.environ.get("MSA_COOKIES_FILE")
     path = Path(path_str) if path_str else default_cookie_path()
@@ -156,7 +218,8 @@ def _load_cookies(cookies: dict[str, str] | str | None) -> dict[str, str]:
     raise RuntimeError(
         "No cookies provided. Either:\n"
         "  - Set MSA_COOKIE (raw 'k=v; k2=v2' header), or\n"
-        "  - Set MSA_COOKIES_FILE to a cookies file (JSON / Netscape / raw header), or\n"
+        "  - Set MSA_COOKIES_FILE to a cookies file "
+        "(JSON / Netscape / raw header), or\n"
         "  - Run `myschoolapp-mcp-refresh` to generate "
         f"{default_cookie_path()}."
     )
@@ -179,25 +242,39 @@ def _load_cookies_from_file(path: Path) -> dict[str, str]:
         raise RuntimeError(f"Cookie file {path} is empty.")
 
     if text.startswith(("{", "[")):
-        data = json.loads(text)
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"Cookie file {path} looks like JSON but failed to parse: {e}"
+            ) from e
         if isinstance(data, dict):
-            return {str(k): str(v) for k, v in data.items()}
-        if isinstance(data, list):
+            out = {str(k): str(v) for k, v in data.items()}
+        elif isinstance(data, list):
             # Browser-export format: [{"name": "...", "value": "...", ...}, ...]
-            return {entry["name"]: entry["value"] for entry in data if "name" in entry}
-        raise RuntimeError(f"Unsupported cookie JSON shape: {type(data).__name__}")
-
-    if "\t" in text:
+            out = {
+                str(entry["name"]): str(entry["value"])
+                for entry in data
+                if isinstance(entry, dict) and "name" in entry and "value" in entry
+            }
+        else:
+            raise RuntimeError(
+                f"Unsupported cookie JSON shape in {path}: {type(data).__name__}"
+            )
+    elif "\t" in text:
         # Netscape cookies.txt: domain/flag/path/secure/expiry/name/value
-        out: dict[str, str] = {}
+        out = {}
         for line in text.splitlines():
             if not line or line.startswith("#"):
                 continue
             parts = line.split("\t")
             if len(parts) >= 7:
                 out[parts[5]] = parts[6]
-        return out
+    else:
+        # Raw Cookie header format: "name=value; name2=value2; ..."
+        # (matches the cookie.txt output of the refresh script)
+        out = _parse_cookie_header(text)
 
-    # Raw Cookie header format: "name=value; name2=value2; ..."
-    # (matches the cookie.txt output of the refresh script)
-    return _parse_cookie_header(text)
+    if not out:
+        raise RuntimeError(f"No cookies could be parsed from {path}.")
+    return out

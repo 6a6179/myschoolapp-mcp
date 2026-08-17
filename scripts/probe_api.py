@@ -9,13 +9,14 @@ It also writes the live cookie jar to the standard MSA cookie file every
 already on disk.
 
 Usage:
-    python scripts/probe_grades.py
+    python scripts/probe_api.py
     # ... log in, navigate, etc. ...
     # press Ctrl+C to stop.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -25,6 +26,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from myschoolapp_mcp.auth import _write_private  # noqa: E402
 from myschoolapp_mcp.client import default_cookie_path, load_env_file  # noqa: E402
 
 
@@ -85,6 +87,8 @@ def main() -> None:
             os.environ.get("MSA_COOKIES_FILE") or default_cookie_path()
         )
         cookie_path.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            os.chmod(cookie_path.parent, 0o700)
         last_saved_count = 0
 
         def _save_cookies():
@@ -94,7 +98,7 @@ def main() -> None:
                 if not cookies:
                     return
                 cookie_string = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
-                cookie_path.write_text(cookie_string, encoding="utf-8")
+                _write_private(cookie_path, cookie_string)
                 if len(cookies) != last_saved_count:
                     print(
                         f"Saved {len(cookies)} cookies to {cookie_path}",

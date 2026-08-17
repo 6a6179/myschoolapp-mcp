@@ -14,7 +14,7 @@ Required env (loaded from .env if python-dotenv is installed):
     SCHOOL_PASS  — Microsoft login password
 
 Optional:
-    HEADLESS=True|False (default False; set True for automation)
+    HEADLESS=True|False (default True; set False to watch the login)
     TIMEOUT=30000  (ms)
     MSA_COOKIES_FILE — output path (default ~/.myschoolapp-mcp/cookie.txt)
 
@@ -23,6 +23,7 @@ Note: 2FA / MFA accounts are not supported by this flow.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 import time
@@ -36,6 +37,15 @@ def _cookie_output_path() -> Path:
     return Path(override) if override else default_cookie_path()
 
 
+def _write_private(path: Path, text: str) -> None:
+    """Write the cookie file with 0600 perms — it's a full session credential."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o600)  # O_CREAT mode only applies to new files
+
+
 def refresh_cookie() -> Path:
     load_env_file()
 
@@ -43,7 +53,12 @@ def refresh_cookie() -> Path:
     email = os.environ.get("SCHOOL_EMAIL")
     password = os.environ.get("SCHOOL_PASS")
     headless = os.environ.get("HEADLESS", "True").lower() == "true"
-    timeout_ms = int(os.environ.get("TIMEOUT", "30000"))
+    try:
+        timeout_ms = int(os.environ.get("TIMEOUT", "30000"))
+    except ValueError:
+        raise RuntimeError(
+            "TIMEOUT must be an integer number of milliseconds."
+        ) from None
 
     if not subdomain or not email or not password:
         raise RuntimeError(
@@ -63,6 +78,8 @@ def refresh_cookie() -> Path:
     login_url = f"https://{subdomain}.myschoolapp.com/app?svcid=edu#login"
     cookie_path = _cookie_output_path()
     cookie_path.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(cookie_path.parent, 0o700)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
@@ -78,11 +95,16 @@ def refresh_cookie() -> Path:
         print("--- Refreshing cookie ---", file=sys.stderr)
         page.goto(login_url)
 
+        email_step_error: str | None = None
         try:
             page.wait_for_selector('input[type="text"], input[type="email"]')
             page.fill('input[type="text"], input[type="email"]', email)
             page.get_by_text("Next", exact=True).click()
         except Exception as e:
+            # Sometimes Microsoft skips straight to the password prompt, so
+            # this isn't necessarily fatal — but remember it in case the
+            # password step fails too.
+            email_step_error = str(e)
             print(f"Warning at email step: {e}", file=sys.stderr)
 
         try:
@@ -91,9 +113,12 @@ def refresh_cookie() -> Path:
             page.fill('input[name="passwd"]', password)
             page.click('input[type="submit"]')
         except Exception as e:
-            print(f"Failed at password step: {e}", file=sys.stderr)
+            msg = f"Failed at password step: {e}"
+            if email_step_error:
+                msg += f" (the email step had already failed: {email_step_error})"
+            print(msg, file=sys.stderr)
             browser.close()
-            raise
+            raise RuntimeError(msg) from e
 
         try:
             page.wait_for_selector('input[id="idSIButton9"]', timeout=5000)
@@ -115,7 +140,7 @@ def refresh_cookie() -> Path:
 
         cookies = context.cookies()
         cookie_string = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
-        cookie_path.write_text(cookie_string, encoding="utf-8")
+        _write_private(cookie_path, cookie_string)
         print(f"Saved {len(cookies)} cookies to {cookie_path}", file=sys.stderr)
 
         browser.close()
