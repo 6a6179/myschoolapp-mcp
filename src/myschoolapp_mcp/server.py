@@ -903,13 +903,55 @@ def gradebook(
 
 
 @mcp.tool()
-def report_card_templates() -> dict[str, Any]:
-    """List report-card templates available for the current school year."""
-    return _get_client().request(
+def report_card_templates(school_year: str | None = None) -> dict[str, Any]:
+    """List modern report-card templates, falling back to legacy reports.
+
+    Only a successful (2xx), error-free empty modern list triggers the
+    legacy performance endpoint. Its successful list is filtered to
+    performance_type == "Report" and tagged source="legacy"; legacy IDs
+    are not modern template IDs. Preserve the response wrapper fields.
+    Nonempty modern results, errors, and non-list responses are unchanged.
+
+    Args:
+        school_year: School-year label (e.g. "2025 - 2026"). Defaults to
+            MSA_SCHOOL_YEAR or the current year derived by _school_year().
+    """
+    client = _get_client()
+    school_year = _school_year() if school_year is None else school_year
+    response = client.request(
         "GET",
         "/api/Grading/StudentReportCardTemplateList",
-        params={"studentId": _student_id(), "schoolYearLabel": _school_year()},
+        params={"studentId": _student_id(), "schoolYearLabel": school_year},
     )
+    if (
+        not 200 <= response.get("status", 0) < 300
+        or response.get("error")
+        or response.get("body") != []
+    ):
+        return response
+
+    legacy = client.request(
+        "GET",
+        "/api/datadirect/ParentStudentUserPerformance/",
+        params={
+            "userId": _student_id(),
+            "personaId": _persona_id(),
+            "schoolYearLabel": school_year,
+        },
+    )
+    if (
+        not 200 <= legacy.get("status", 0) < 300
+        or legacy.get("error")
+        or not isinstance(legacy.get("body"), list)
+    ):
+        return legacy
+    return {
+        **legacy,
+        "body": [
+            row for row in legacy["body"] if row.get("performance_type") == "Report"
+        ],
+        "source": "legacy",
+    }
 
 
 @mcp.tool()

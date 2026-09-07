@@ -147,6 +147,25 @@ installed package to the project root. If your client launches it from
 an unrelated working directory, copy your `.env` to
 `~/.myschoolapp-mcp/.env`.
 
+## Report cards
+
+`report_card_templates(school_year="2025 - 2026")` selects a school-year
+label explicitly. Omit `school_year` (or pass `None`) to keep the existing
+default: `MSA_SCHOOL_YEAR`, or the school year derived from today's date.
+The same label is used for both requests below.
+
+The tool first calls `/api/Grading/StudentReportCardTemplateList`. Only
+an error-free 2xx response with body exactly `[]` falls back to the
+website's legacy `/api/datadirect/ParentStudentUserPerformance/` endpoint.
+A successful legacy list is filtered to `performance_type == "Report"`;
+the `status`, `url`, and other wrapper fields are retained, with
+`source: "legacy"` added. Legacy entries retain their original fields
+and IDs; those IDs are not modern report-card template IDs.
+
+Nonempty modern results remain unchanged. Errors and non-list responses
+from either endpoint are returned unchanged; modern errors never trigger
+a fallback. This lists report metadata, not report document contents.
+
 ## Caveats
 
 - Some tools return school-specific IDs (`categoryId` for official
