@@ -206,9 +206,27 @@ class TestGradeParsing:
         assert to_float("") is None
         assert to_float("N/A") is None
 
+    def test_missing_grade_placeholders(self):
+        for value in (
+            -79228162514264337593543950335,
+            "-79228162514264337593543950335",
+            -7.922816251426434e28,
+            SENTINEL,
+            str(SENTINEL),
+            "NaN",
+            "Infinity",
+            "-Infinity",
+            10**400,
+        ):
+            assert to_float(value) is None
+            assert fmt_pct(value) is None
+            assert compact_class({"cumgrade": value})["current_grade"] is None
+
     def test_real_values(self):
         assert to_float("85.5") == 85.5
         assert to_float(100) == 100.0
+        assert fmt_pct(105.5) == "105.50%"
+        assert to_float(-1) == -1.0
 
 
 class TestFormatRange:

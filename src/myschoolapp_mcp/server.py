@@ -693,11 +693,11 @@ def student_terms() -> dict[str, Any]:
     """List the student's terms (durations) for the school year.
 
     Each row has DurationId + DurationDescription (e.g. "Year Long",
-    "Fall Season"), OfferingType (3 = academics, 9 = athletics/afternoon
-    program, 11 = continuous/community groups), and CurrentInd (1 = term is
-    currently active). DurationId values feed `classes`, `gradebook`, and
-    `group_membership` — though those tools auto-resolve the current
-    academic duration if you don't pass one.
+    "Fall Season"), OfferingType (1 = academics, 2 = activities,
+    3 = advisory, 4 = dorm, 9 = athletics, 11 = community), and CurrentInd
+    (1 = term is currently active). DurationId values feed `classes`,
+    `gradebook`, and `group_membership`; those tools auto-resolve the
+    current term for their offering type when omitted. Community uses 0.
     """
     return _get_client().request(
         "GET",
@@ -710,17 +710,9 @@ def student_terms() -> dict[str, Any]:
     )
 
 
-def _resolve_duration_id() -> int:
-    """Pick the current academic DurationId from StudentGroupTermList."""
-    resp = _get_client().request(
-        "GET",
-        "/api/DataDirect/StudentGroupTermList/",
-        params={
-            "studentUserId": _student_id(),
-            "schoolYearLabel": _school_year(),
-            "personaId": _persona_id(),
-        },
-    )
+def _resolve_duration_id(offering_type: int = 1) -> int:
+    """Pick the current term for an offering type (academics by default)."""
+    resp = student_terms()
     body = resp.get("body")
     if resp.get("error") or not isinstance(body, list):
         raise RuntimeError(
@@ -730,16 +722,17 @@ def _resolve_duration_id() -> int:
     current = [
         t
         for t in body
-        if isinstance(t, dict) and t.get("CurrentInd") and t.get("DurationId")
+        if isinstance(t, dict)
+        and t.get("CurrentInd")
+        and t.get("DurationId")
+        and t.get("OfferingType") == offering_type
     ]
     if not current:
         raise RuntimeError(
-            "No currently-active term with a DurationId found. "
+            f"No currently-active term for OfferingType {offering_type} found. "
             "Pass duration_id explicitly — see student_terms()."
         )
-    # OfferingType 3 = academics (observed); athletics is 9, community 11.
-    academic = [t for t in current if t.get("OfferingType") == 3]
-    return int((academic or current)[0]["DurationId"])
+    return int(current[0]["DurationId"])
 
 
 def _fetch_classes(duration_id: int, marking_period_id: str = "") -> dict[str, Any]:
@@ -973,12 +966,12 @@ def grade_levels() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-_GROUP_ENDPOINTS: dict[str, tuple[str, str]] = {
-    "advisory": ("ParentStudentUserAdvisoryGroupsGet", "durationId"),
-    "athletic": ("ParentStudentUserAthleticGroupsGet", "durationList"),
-    "dorm": ("ParentStudentUserDormGroupsGet", "durationId"),
-    "activity": ("ParentStudentUserActivityGroupsGet", "durationId"),
-    "community": ("ParentStudentUserCommunityGroupsGet", "durationId"),
+_GROUP_ENDPOINTS: dict[str, tuple[str, str, int]] = {
+    "advisory": ("ParentStudentUserAdvisoryGroupsGet", "durationId", 3),
+    "athletic": ("ParentStudentUserAthleticGroupsGet", "durationList", 9),
+    "dorm": ("ParentStudentUserDormGroupsGet", "durationId", 4),
+    "activity": ("ParentStudentUserActivityGroupsGet", "durationId", 2),
+    "community": ("ParentStudentUserCommunityGroupsGet", "durationId", 11),
 }
 
 
@@ -988,14 +981,17 @@ def group_membership(kind: str, duration_id: int = 0) -> dict[str, Any]:
 
     Args:
         kind: One of: advisory, athletic, dorm, activity, community.
-        duration_id: A DurationId from `student_terms()`. Use 0 for community
-            (school-wide).
+        duration_id: A DurationId from `student_terms()`. 0 / omitted =
+            auto-resolve the current term for this kind of group.
+            Community defaults to 0 (school-wide), without a term lookup.
     """
     if kind not in _GROUP_ENDPOINTS:
         raise ValueError(
             f"Unknown kind '{kind}'. Valid: {', '.join(sorted(_GROUP_ENDPOINTS))}."
         )
-    endpoint, dur_param = _GROUP_ENDPOINTS[kind]
+    endpoint, dur_param, offering_type = _GROUP_ENDPOINTS[kind]
+    if not duration_id and kind != "community":
+        duration_id = _resolve_duration_id(offering_type)
     return _get_client().request(
         "GET",
         f"/api/datadirect/{endpoint}",

@@ -7,6 +7,7 @@ I/O. That keeps it unit-testable without a live session.
 from __future__ import annotations
 
 import html
+import math
 import re
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -200,21 +201,23 @@ def strip_html(s: Any) -> str | None:
 
 
 def fmt_pct(n: Any) -> str | None:
-    """Format a number like 85.39 as '85.39%'. Returns None for empty/zero."""
+    """Format a grade like 85.39 as '85.39%'; missing grades stay None."""
     f = to_float(n)
     return None if f is None else f"{f:.2f}%"
 
 
 def to_float(n: Any) -> float | None:
-    """Parse a grade value. The API uses 0 for 'no grade yet', so exact 0
-    maps to None rather than 0%."""
+    """Parse a grade, mapping the API's missing-grade placeholders to None."""
     if n is None or n == "":
         return None
     try:
         f = float(n)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
-    return f if f != 0 else None
+    # The large negative value is the API's decimal missing-grade sentinel.
+    if not math.isfinite(f) or f in (0, SENTINEL, -7.922816251426434e28):
+        return None
+    return f
 
 
 def format_range(low: Any, high: Any) -> str | None:
