@@ -5,7 +5,8 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING, Any
 
-from .formatting import mdy, strip_html
+from .errors import SessionError, UserError
+from .formatting import SENTINEL, mdy, strip_html
 
 if TYPE_CHECKING:
     from .client import MyschoolappClient
@@ -39,17 +40,17 @@ def _compact_events(rows: list) -> list[dict]:
         if not isinstance(row, dict) or not all(
             field in row for field in ("EventId", "UserId", "StartDate", "Title")
         ):
-            raise ValueError(message)
+            raise UserError(message)
         key = (row["EventId"], row["UserId"], row["StartDate"])
         if all(value is None for value in key):
-            raise ValueError(message)
+            raise UserError(message)
         try:
             hash(key)
         except TypeError:
-            raise ValueError(message) from None
+            raise UserError(message) from None
         if key not in events:
             item = {
-                name: row[field]
+                name: (None if row[field] == SENTINEL else row[field])
                 for field, name in _EVENT_FIELDS.items()
                 if field in row
             }
@@ -125,7 +126,7 @@ def _select_calendar_ids(definitions: list, requested: list[str] | None) -> list
     if requested is not None:
         for calendar_id in requested:
             if calendar_id not in supported:
-                raise ValueError(
+                raise UserError(
                     f"Unknown or unsupported calendar ID: {calendar_id!r}."
                 )
         selected = requested
@@ -157,10 +158,10 @@ def fetch_calendar_events(
         if not isinstance(value, str) or not re.fullmatch(
             r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value
         ):
-            raise ValueError("Invalid date: expected YYYY-MM-DD.")
+            raise UserError("Invalid date: expected YYYY-MM-DD.")
     start, end = mdy(date_start), mdy(date_end)
     if date_start > date_end:
-        raise ValueError("date_start must be on or before date_end.")
+        raise UserError("date_start must be on or before date_end.")
     definitions = client.request(
         "GET",
         "/api/mycalendar/list/",
@@ -188,7 +189,7 @@ def fetch_calendar_events(
     try:
         csrf = client.request("GET", "/api/security/csrftoken")
     except RuntimeError:
-        raise RuntimeError("CSRF token request failed.") from None
+        raise SessionError("CSRF token request failed.") from None
     token = csrf.get("body")
     if (
         not _succeeded(csrf)
@@ -220,7 +221,7 @@ def fetch_calendar_events(
         )
     except RuntimeError as exc:
         # The transport's exception chain may contain request header values.
-        raise RuntimeError(_redact_token(str(exc), token)) from None
+        raise SessionError(_redact_token(str(exc), token)) from None
     response = _redact_token(response, token)
     if not _succeeded(response):
         return _error(response, "Calendar events request failed.")

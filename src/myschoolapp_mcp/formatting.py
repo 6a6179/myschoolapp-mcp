@@ -99,7 +99,15 @@ def compact_assignment(item: dict[str, Any]) -> dict[str, Any]:
         # Unrecognized schema — pass the item through rather than silently
         # dropping every field.
         return dict(item)
+    # Titles arrive HTML-escaped (e.g. trailing "&#160;"); make them readable.
+    if isinstance(out.get("title"), str):
+        out["title"] = clean_text(out["title"])
     return out
+
+
+def clean_text(s: str) -> str:
+    """Unescape HTML entities and collapse odd whitespace (incl. NBSP)."""
+    return " ".join(html.unescape(s).split())
 
 
 def parse_assignment_date(raw: Any) -> date | None:

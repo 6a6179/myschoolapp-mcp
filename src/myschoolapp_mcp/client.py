@@ -5,6 +5,9 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import threading
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -12,10 +15,31 @@ from urllib.parse import urlsplit
 import httpx
 
 _EXPIRED_COOKIE_HINT = (
-    "Got an HTML page instead of JSON — the session cookie is probably "
-    "expired or invalid. Run the cookie_refresh tool (or "
-    "`myschoolapp-mcp-refresh`) and retry."
+    "The session cookie is expired or invalid. Run the cookie_refresh tool "
+    "(or `myschoolapp-mcp-refresh`) and retry."
 )
+_EXPIRED_HTML_HINT = "Got an HTML page instead of JSON — " + _EXPIRED_COOKIE_HINT
+
+# Blackbaud returns this JSON body (HTTP 403) once the session token dies.
+_AUTH_ERROR_TYPES = {"INVALID_AUTHORIZATION"}
+
+# Minimum seconds between automatic refresh attempts, so a broken login
+# flow cannot hammer Microsoft with Playwright sessions on every request.
+AUTO_REFRESH_COOLDOWN_S = 60.0
+
+RefreshHook = Callable[[], dict[str, str]]
+
+
+def is_auth_expired(response: dict[str, Any]) -> bool:
+    """True when a request() result means the session is dead."""
+    if response.get("auth_expired"):
+        return True
+    body = response.get("body")
+    return (
+        response.get("status") in (401, 403)
+        and isinstance(body, dict)
+        and body.get("ErrorType") in _AUTH_ERROR_TYPES
+    )
 
 
 class RequestBoundaryError(ValueError):
@@ -38,19 +62,17 @@ class MyschoolappClient:
         self.base_url = f"https://{self.subdomain}.myschoolapp.com"
         self._host = f"{self.subdomain}.myschoolapp.com".lower()
 
-        cookie_dict = _load_cookies(cookies, allowed_host=self._host)
+        # Optional callback that logs in again and returns fresh cookies.
+        # When set, an expired-session response triggers one refresh + retry.
+        self.refresh_hook: RefreshHook | None = None
+        self._refresh_lock = threading.Lock()
+        self._last_refresh_attempt = 0.0
 
-        # Scope every cookie to the school host. A plain dict jar in httpx
-        # is domain-unscoped and would happily be sent to any absolute URL.
-        jar = httpx.Cookies()
-        for name, value in cookie_dict.items():
-            jar.set(name, value, domain=self._host)
-        for cookie in jar.jar:
-            cookie.secure = True
+        cookie_dict = _load_cookies(cookies, allowed_host=self._host)
 
         self._client = httpx.Client(
             base_url=self.base_url,
-            cookies=jar,
+            cookies=self._build_jar(cookie_dict),
             headers={
                 "Accept": "application/json, text/plain, */*",
                 "Accept-Language": "en-US,en;q=0.9",
@@ -66,6 +88,36 @@ class MyschoolappClient:
             follow_redirects=True,
             event_hooks={"request": [self._validate_request]},
         )
+
+    def _build_jar(self, cookie_dict: dict[str, str]) -> httpx.Cookies:
+        # Scope every cookie to the school host. A plain dict jar in httpx
+        # is domain-unscoped and would happily be sent to any absolute URL.
+        jar = httpx.Cookies()
+        for name, value in cookie_dict.items():
+            jar.set(name, value, domain=self._host)
+        for cookie in jar.jar:
+            cookie.secure = True
+        return jar
+
+    def replace_cookies(self, cookie_dict: dict[str, str]) -> None:
+        """Swap the session cookies in place (used after a refresh)."""
+        self._client.cookies = self._build_jar(cookie_dict)
+
+    def _try_auto_refresh(self) -> bool:
+        """Run the refresh hook at most once per cooldown. True if refreshed."""
+        hook = self.refresh_hook
+        if hook is None:
+            return False
+        with self._refresh_lock:
+            now = time.monotonic()
+            if now - self._last_refresh_attempt < AUTO_REFRESH_COOLDOWN_S:
+                return False
+            self._last_refresh_attempt = now
+            fresh = hook()
+            if not fresh:
+                return False
+            self.replace_cookies(fresh)
+            return True
 
     def _resolve_path(self, path: str) -> str:
         return resolve_request_path(path, self._host)
@@ -85,6 +137,38 @@ class MyschoolappClient:
         json_body: Any | None = None,
         data: dict[str, Any] | None = None,
         extra_headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        out = self._request_once(method, path, params, json_body, data, extra_headers)
+        if is_auth_expired(out):
+            out["auth_expired"] = True
+            out.setdefault("hint", _EXPIRED_COOKIE_HINT)
+            try:
+                refreshed = self._try_auto_refresh()
+            except Exception as exc:  # login flow broke; report, don't raise
+                out["auto_refresh_error"] = f"{type(exc).__name__}: {exc}"
+                return out
+            if refreshed:
+                out = self._request_once(
+                    method, path, params, json_body, data, extra_headers
+                )
+                if is_auth_expired(out):
+                    out["auth_expired"] = True
+                    out.setdefault("hint", _EXPIRED_COOKIE_HINT)
+                    out["auto_refresh_error"] = (
+                        "Session refreshed but the request is still unauthorized."
+                    )
+                else:
+                    out["auto_refreshed"] = True
+        return out
+
+    def _request_once(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, Any] | None,
+        json_body: Any,
+        data: dict[str, Any] | None,
+        extra_headers: dict[str, str] | None,
     ) -> dict[str, Any]:
         path = self._resolve_path(path)
 
@@ -124,7 +208,8 @@ class MyschoolappClient:
                 # 50 KB of markup.
                 out["body"] = text[:2_000]
                 out["error"] = True
-                out["hint"] = _EXPIRED_COOKIE_HINT
+                out["auth_expired"] = True
+                out["hint"] = _EXPIRED_HTML_HINT
             elif len(text) > 50_000:
                 out["body"] = text[:50_000]
                 out["truncated"] = True
@@ -150,9 +235,7 @@ def resolve_request_path(path: str, allowed_host: str) -> str:
     path = path.strip()
     parts = urlsplit(path)
     if parts.scheme or parts.netloc:
-        if parts.scheme not in ("", "https") or (
-            parts.netloc.lower() != allowed_host
-        ):
+        if parts.scheme not in ("", "https") or (parts.netloc.lower() != allowed_host):
             raise ValueError(
                 f"Refusing to send the session cookie to {path!r}: only "
                 f"https://{allowed_host} is allowed. Use a path like '/api/...'."
