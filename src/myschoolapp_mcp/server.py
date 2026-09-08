@@ -23,6 +23,7 @@ from mcp.server.mcpserver import MCPServer
 
 from . import __version__
 from .client import MyschoolappClient, RequestBoundaryError, load_env_file
+from .errors import SessionError, UserError
 from .formatting import (
     ASSIGNMENT_BUCKETS,
     DEFAULT_ASSIGNMENT_BUCKETS,
@@ -55,7 +56,38 @@ def _get_client() -> MyschoolappClient:
     with _client_lock:
         if _client is None:
             _client = MyschoolappClient()
+            _install_refresh_hook(_client)
         return _client
+
+
+def _auto_refresh_enabled() -> bool:
+    return os.environ.get("MSA_AUTO_REFRESH", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _install_refresh_hook(client: MyschoolappClient) -> None:
+    """Let the client re-login once on an expired session, if opted in.
+
+    MSA_AUTO_REFRESH=true plus SCHOOL_EMAIL/SCHOOL_PASS are required; the
+    hook runs the same Playwright flow as cookie_refresh, on the calling
+    thread (tools are sync and the SDK already offloads them).
+    """
+    if not _auto_refresh_enabled():
+        return
+    if not (os.environ.get("SCHOOL_EMAIL") and os.environ.get("SCHOOL_PASS")):
+        return
+
+    def hook() -> dict[str, str]:
+        from .auth import refresh_cookie
+        from .client import _load_cookies_from_file
+
+        return _load_cookies_from_file(refresh_cookie())
+
+    client.refresh_hook = hook
 
 
 def _drop_client() -> None:
@@ -70,7 +102,7 @@ def _drop_client() -> None:
 def _student_id() -> str:
     sid = os.environ.get("MSA_STUDENT_ID")
     if not sid:
-        raise RuntimeError(
+        raise SessionError(
             "Set MSA_STUDENT_ID to your numeric persona user id. Find it in "
             "any /api/user/profiletabs?showuserid=... request in DevTools."
         )
@@ -86,7 +118,7 @@ def _school_timezone() -> ZoneInfo:
     try:
         return ZoneInfo(name)
     except (ZoneInfoNotFoundError, ValueError):
-        raise ValueError(
+        raise UserError(
             f"Invalid MSA_TIMEZONE {name!r}. Use an available IANA timezone "
             "such as 'America/New_York' or 'UTC' (default)."
         ) from None
@@ -137,6 +169,8 @@ def config() -> dict[str, Any]:
         "school_year": _school_year(),
         "timezone": _school_timezone().key,
         "env_file": str(_ENV_PATH) if _ENV_PATH else None,
+        "auto_refresh": client.refresh_hook is not None,
+        "api_request_writes": _api_writes_allowed(),
     }
 
 
@@ -168,6 +202,7 @@ async def cookie_refresh() -> dict[str, Any]:
     # thread.
     path = await asyncio.to_thread(refresh_cookie)
     fresh_client = MyschoolappClient(cookies=_load_cookies_from_file(path))
+    _install_refresh_hook(fresh_client)
     with _client_lock:
         previous_client = _client
         _client = fresh_client
@@ -187,6 +222,7 @@ def assignments(
     display_by_due_date: bool = True,
     buckets: str = "",
     full: bool = False,
+    days_ahead: int = 60,
 ) -> dict[str, Any]:
     """Get assignments grouped by due-date bucket (or by class).
 
@@ -199,9 +235,11 @@ def assignments(
     DueNextWeek, DueAfterNextWeek, PastThisWeek, PastLastWeek,
     PastBeforeLastWeek. Weeks run Monday-Sunday. PastBeforeLastWeek is
     excluded by default because it can contain hundreds of items; requesting
-    it widens the fetch window to ~6 months back. Missing/Overdue come from
-    the server's missing/overdue filter; items flagged there are removed
-    from the date buckets so nothing is listed twice.
+    it widens the fetch window to ~6 months back. The forward window is
+    `days_ahead` days (default 60), so DueAfterNextWeek only covers that
+    horizon — raise days_ahead for a full-semester view. Missing/Overdue
+    come from the server's missing/overdue filter; items flagged there are
+    removed from the date buckets so nothing is listed twice.
 
     Each compact item includes assignment_id, assignment_index_id (pass to
     `assignment_detail`), section_id, class, title, type, assigned, due,
@@ -218,7 +256,10 @@ def assignments(
             When display_by_due_date is False this only controls how far
             back the fetch window reaches (PastBeforeLastWeek widens it).
         full: True = return the raw, untrimmed endpoint responses.
+        days_ahead: How far forward to fetch (1-365, default 60).
     """
+    if not 1 <= days_ahead <= 365:
+        raise UserError("days_ahead must be between 1 and 365.")
     if not buckets:
         wanted = set(DEFAULT_ASSIGNMENT_BUCKETS)
     elif buckets.strip().lower() == "all":
@@ -227,7 +268,7 @@ def assignments(
         wanted = {b.strip() for b in buckets.split(",") if b.strip()}
         unknown = wanted - set(ASSIGNMENT_BUCKETS)
         if unknown:
-            raise ValueError(
+            raise UserError(
                 f"Unknown bucket(s) {sorted(unknown)}. "
                 f"Valid: {', '.join(ASSIGNMENT_BUCKETS)} (or 'all')."
             )
@@ -248,7 +289,7 @@ def assignments(
             **common,
             "filter": 0,
             "dateStart": mdy((today - timedelta(days=days_back)).isoformat()),
-            "dateEnd": mdy((today + timedelta(days=60)).isoformat()),
+            "dateEnd": mdy((today + timedelta(days=days_ahead)).isoformat()),
         },
     )
 
@@ -350,6 +391,10 @@ def assignments(
         "status": resp.get("status"),
         "url": resp.get("url"),
         "counts": counts,
+        "window": {
+            "start": (today - timedelta(days=days_back)).isoformat(),
+            "end": (today + timedelta(days=days_ahead)).isoformat(),
+        },
         "buckets_included": sorted(out_buckets.keys()),
         "buckets": out_buckets,
         "sections": list(seen_sections.values()),
@@ -477,11 +522,7 @@ def _clean_submission(client: MyschoolappClient, s: dict[str, Any]) -> dict[str,
 
 def _response_succeeded(response: dict[str, Any]) -> bool:
     status = response.get("status")
-    return (
-        isinstance(status, int)
-        and 200 <= status < 300
-        and not response.get("error")
-    )
+    return isinstance(status, int) and 200 <= status < 300 and not response.get("error")
 
 
 def _request_assignment_component(
@@ -777,14 +818,12 @@ def student_terms(school_year: str | None = None) -> dict[str, Any]:
     )
 
 
-def _resolve_duration_id(
-    offering_type: int = 1, school_year: str | None = None
-) -> int:
+def _resolve_duration_id(offering_type: int = 1, school_year: str | None = None) -> int:
     """Pick the current term for an offering type (academics by default)."""
     resp = student_terms() if school_year is None else student_terms(school_year)
     body = resp.get("body")
     if not _response_succeeded(resp) or not isinstance(body, list):
-        raise RuntimeError(
+        raise SessionError(
             f"Could not auto-resolve duration_id (status {resp.get('status')}). "
             "Pass duration_id explicitly — see student_terms()."
         )
@@ -797,7 +836,7 @@ def _resolve_duration_id(
         and t.get("OfferingType") == offering_type
     ]
     if not current:
-        raise RuntimeError(
+        raise SessionError(
             f"No currently-active term for OfferingType {offering_type} found. "
             "Pass duration_id explicitly — see student_terms()."
         )
@@ -1017,8 +1056,12 @@ def gradebook(
     failures = [row for row in out if row.get("error")]
     if failures:
         partial = len(failures) < len(out)
+        # `status` here is a synthetic summary code for this tool's wrapper,
+        # not an HTTP status from the school: 207 = some sections failed,
+        # 502 = every graded section failed.
         result.update(
             status=207 if partial else 502,
+            status_source="synthetic",
             error=f"Could not verify gradebook for {len(failures)} section(s)",
             partial=partial,
         )
@@ -1189,7 +1232,7 @@ def group_membership(
             duration_id from `student_terms(school_year=...)`.
     """
     if kind not in _GROUP_ENDPOINTS:
-        raise ValueError(
+        raise UserError(
             f"Unknown kind '{kind}'. Valid: {', '.join(sorted(_GROUP_ENDPOINTS))}."
         )
     endpoint, dur_param, offering_type = _GROUP_ENDPOINTS[kind]
@@ -1281,8 +1324,12 @@ def calendar_events(
     from .calendar_tools import fetch_calendar_events
 
     return fetch_calendar_events(
-        _get_client(), date_start, date_end,
-        calendar_ids=calendar_ids, include_practice=include_practice, full=full,
+        _get_client(),
+        date_start,
+        date_end,
+        calendar_ids=calendar_ids,
+        include_practice=include_practice,
+        full=full,
     )
 
 
@@ -1463,6 +1510,18 @@ def directory_facets(directory_id: int) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+def _api_writes_allowed() -> bool:
+    return os.environ.get("MSA_ALLOW_WRITES", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 @mcp.tool()
 def api_request(
     method: str,
@@ -1480,6 +1539,10 @@ def api_request(
     Requests are pinned to the school's own host — absolute URLs pointing
     anywhere else are rejected so the session cookie can't leak.
 
+    Only GET/HEAD/OPTIONS are allowed unless the server was started with
+    MSA_ALLOW_WRITES=true. Every typed tool is read-only; this is the one
+    place a write could happen, so it is off by default.
+
     Args:
         method: HTTP method.
         path: Path starting with `/`.
@@ -1488,8 +1551,14 @@ def api_request(
         form_data: Form-encoded body.
         extra_headers: Additional headers (e.g. X-CSRF-Token).
     """
+    verb = method.strip().upper()
+    if verb not in _SAFE_METHODS and not _api_writes_allowed():
+        raise UserError(
+            f"api_request refuses {verb}: write methods are disabled. Start the "
+            "server with MSA_ALLOW_WRITES=true to permit POST/PUT/PATCH/DELETE."
+        )
     return _get_client().request(
-        method,
+        verb,
         path,
         params=params,
         json_body=json_body,

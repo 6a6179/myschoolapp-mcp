@@ -145,6 +145,33 @@ If 2FA is on, log in to the site in a normal browser, export your
 cookies with any standard cookie-export extension, and point
 `MSA_COOKIES_FILE` at the result.
 
+#### Automatic re-login on an expired session (opt-in)
+
+Sessions on some deployments die within hours. Every response that
+means "session dead" — a JSON 403 with
+`ErrorType: INVALID_AUTHORIZATION` or an HTML login page — now carries
+`auth_expired: true` plus a `hint`. Set
+
+```bash
+MSA_AUTO_REFRESH=true
+```
+
+(with `SCHOOL_EMAIL` / `SCHOOL_PASS` present) and the server will run the
+Playwright login **once**, swap in the new cookies, and retry the same
+request transparently; the result then includes `auto_refreshed: true`.
+A cooldown of 60 s between attempts stops a broken login flow from
+looping. Failures are reported in `auto_refresh_error` rather than
+raised. `config()` shows `auto_refresh` so you can tell which mode is
+active. Off by default because it means a tool call can start a
+password login without anyone asking.
+
+#### `api_request` write gate
+
+Every typed tool is read-only. `api_request` accepts only
+`GET`/`HEAD`/`OPTIONS` unless the server is started with
+`MSA_ALLOW_WRITES=true`; other methods raise before any request is
+sent. `config()` reports `api_request_writes`.
+
 **Security note:** the cookie file is a full session credential and
 `.env` contains a login password if you configured automatic refresh.
 The refresh script writes
@@ -394,8 +421,13 @@ a fallback. This lists report metadata, not report document contents.
   `.env` and watch what happens.
 - Typed school-data tools are read-only. `calendar_events` uses the site's
   read POST without creating events or saving preferences. `cookie_refresh`
-  signs in and writes a local cookie file. The existing `api_request`
-  escape hatch supports arbitrary HTTP methods and is not read-only.
+  signs in and writes a local cookie file. The `api_request` escape hatch
+  is limited to read methods unless `MSA_ALLOW_WRITES=true`.
+- `assignments` fetches `days_ahead` days forward (default 60), so
+  `DueAfterNextWeek` only covers that horizon; the response's `window`
+  field shows the exact range. `gradebook` reports a synthetic `status`
+  (207 partial / 502 all failed, marked `status_source: synthetic`) that
+  is not an HTTP status from the school.
 
 ## Development
 
