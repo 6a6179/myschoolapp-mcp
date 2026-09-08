@@ -169,7 +169,8 @@ _HTML_BLOCK_TAGS = re.compile(
 _HTML_BREAK_TAGS = re.compile(r"<\s*br\s*/?\s*>", re.IGNORECASE)
 _HTML_LIST_ITEM = re.compile(r"<\s*li[^>]*>", re.IGNORECASE)
 _HTML_LINK = re.compile(
-    r'<\s*a\b[^>]*?href\s*=\s*"([^"]+)"[^>]*>(.*?)</\s*a\s*>',
+    r'''<\s*a\b[^>]*?\s+href\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))'''
+    r'[^>]*>(.*?)</\s*a\s*>',
     re.IGNORECASE | re.DOTALL,
 )
 _HTML_TAG = re.compile(r"<[^>]+>")
@@ -183,7 +184,13 @@ def strip_html(s: Any) -> str | None:
         return None
     out = s
     # Anchors → "label (url)" so the model still sees the destination.
-    out = _HTML_LINK.sub(lambda m: f"{m.group(2).strip()} ({m.group(1).strip()})", out)
+    out = _HTML_LINK.sub(
+        lambda m: (
+            f"{m.group(4).strip()} "
+            f"({(m.group(1) or m.group(2) or m.group(3) or '').strip()})"
+        ),
+        out,
+    )
     out = _HTML_LIST_ITEM.sub("\n- ", out)
     out = _HTML_BREAK_TAGS.sub("\n", out)
     out = _HTML_BLOCK_TAGS.sub("\n\n", out)
@@ -215,7 +222,7 @@ def to_float(n: Any) -> float | None:
     except (TypeError, ValueError, OverflowError):
         return None
     # The large negative value is the API's decimal missing-grade sentinel.
-    if not math.isfinite(f) or f in (0, SENTINEL, -7.922816251426434e28):
+    if not math.isfinite(f) or f in (SENTINEL, -7.922816251426434e28):
         return None
     return f
 
@@ -297,10 +304,12 @@ _CLASS_KEY_MAP: dict[str, str] = {
 
 def compact_class(c: dict[str, Any]) -> dict[str, Any]:
     out = {canon: c[raw] for raw, canon in _CLASS_KEY_MAP.items() if raw in c}
-    # cumgrade uses 0 for "no grade yet" — honor the same convention
-    # gradebook() does instead of presenting it as a real 0%.
+    # Only a class-list zero with no display is the "no grade yet" marker.
+    # Hydrated SectionGrade values and displayed class zeros are real grades.
     if "current_grade" in out:
         out["current_grade"] = to_float(out["current_grade"])
+        if out["current_grade"] == 0 and not c.get("CumulativeDisplay"):
+            out["current_grade"] = None
     if "current_grade_display" in out:
         out["current_grade_display"] = or_none(out["current_grade_display"])
     return out

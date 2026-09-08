@@ -1,5 +1,6 @@
 """Unit tests for cookie parsing and URL gating. No network needed."""
 
+import httpx
 import pytest
 
 from myschoolapp_mcp.client import (
@@ -11,6 +12,95 @@ from myschoolapp_mcp.client import (
 )
 
 HOST = "testschool.myschoolapp.com"
+
+
+@pytest.fixture
+def mock_transport_client(monkeypatch):
+    """Exercise the real HTTPX redirect loop with an entirely offline transport."""
+    original_client = httpx.Client
+    clients = []
+
+    def make(handler):
+        monkeypatch.setattr(
+            httpx,
+            "Client",
+            lambda **kwargs: original_client(
+                transport=httpx.MockTransport(handler), trust_env=False, **kwargs
+            ),
+        )
+        client = MyschoolappClient(subdomain="testschool", cookies={"t": "synthetic"})
+        clients.append(client)
+        return client
+
+    yield make
+    for client in clients:
+        client.close()
+
+
+@pytest.mark.parametrize(
+    "destination",
+    [
+        f"http://{HOST}/steal",
+        "https://other-school.myschoolapp.com/steal",
+        f"https://child.{HOST}/steal",
+        f"https://{HOST}.example.com/steal",
+    ],
+)
+def test_redirect_validated_before_every_send(mock_transport_client, destination):
+    sent = []
+
+    def handler(request):
+        sent.append(request)
+        if request.url.path == "/start":
+            return httpx.Response(302, headers={"Location": "/next"})
+        if request.url.path == "/next":
+            return httpx.Response(302, headers={"Location": destination})
+        return httpx.Response(200, json={"unexpected": "unsafe request sent"})
+
+    client = mock_transport_client(handler)
+    with pytest.raises(ValueError, match="Refusing to send"):
+        client.request("GET", "/start")
+
+    assert [str(request.url) for request in sent] == [
+        f"https://{HOST}/start",
+        f"https://{HOST}/next",
+    ]
+    assert all(request.headers["cookie"] == "t=synthetic" for request in sent)
+
+
+@pytest.mark.parametrize(
+    ("status", "content_type", "body", "expected_body", "error"),
+    [
+        (200, "application/json", '{"ok": true}', {"ok": True}, False),
+        (403, "application/json", '{"denied": true}', {"denied": True}, True),
+        (200, "text/html", "<html>Sign in</html>", "<html>Sign in</html>", True),
+    ],
+)
+def test_same_host_https_redirect_preserves_response_handling(
+    mock_transport_client, status, content_type, body, expected_body, error
+):
+    sent = []
+
+    def handler(request):
+        sent.append(request)
+        if request.url.path == "/start":
+            return httpx.Response(
+                302, headers={"Location": f"https://{HOST}/result"}
+            )
+        return httpx.Response(
+            status, headers={"Content-Type": content_type}, text=body
+        )
+
+    result = mock_transport_client(handler).request("GET", "/start")
+
+    assert result["status"] == status
+    assert result["url"] == f"https://{HOST}/result"
+    assert result["body"] == expected_body
+    assert bool(result.get("error")) is error
+    assert len(sent) == 2
+    assert all(request.headers["cookie"] == "t=synthetic" for request in sent)
+    if content_type == "text/html":
+        assert "cookie_refresh" in result["hint"]
 
 
 class TestResolveRequestPath:
@@ -139,6 +229,13 @@ class TestCookieScoping:
         try:
             domains = {c.domain for c in client._client.cookies.jar}
             assert domains == {"testschool.myschoolapp.com"}
+        finally:
+            client.close()
+
+    def test_loaded_cookies_are_secure(self):
+        client = MyschoolappClient(subdomain="testschool", cookies={"t": "synthetic"})
+        try:
+            assert all(cookie.secure for cookie in client._client.cookies.jar)
         finally:
             client.close()
 

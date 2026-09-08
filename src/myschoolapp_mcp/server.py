@@ -13,13 +13,16 @@ import asyncio
 import contextlib
 import os
 import threading
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
+from urllib.parse import urljoin, urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import httpx
 from mcp.server.mcpserver import MCPServer
 
 from . import __version__
-from .client import MyschoolappClient, load_env_file
+from .client import MyschoolappClient, RequestBoundaryError, load_env_file
 from .formatting import (
     ASSIGNMENT_BUCKETS,
     DEFAULT_ASSIGNMENT_BUCKETS,
@@ -78,11 +81,26 @@ def _persona_id() -> str:
     return os.environ.get("MSA_PERSONA_ID", "2")  # 2 = student
 
 
+def _school_timezone() -> ZoneInfo:
+    name = os.environ.get("MSA_TIMEZONE", "UTC")
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise ValueError(
+            f"Invalid MSA_TIMEZONE {name!r}. Use an available IANA timezone "
+            "such as 'America/New_York' or 'UTC' (default)."
+        ) from None
+
+
+def _today() -> date:
+    return datetime.now(_school_timezone()).date()
+
+
 def _school_year() -> str:
     sy = os.environ.get("MSA_SCHOOL_YEAR")
     if sy:
         return sy
-    today = date.today()
+    today = _today()
     if today.month >= 7:
         return f"{today.year} - {today.year + 1}"
     return f"{today.year - 1} - {today.year}"
@@ -109,7 +127,7 @@ def whoami() -> dict[str, Any]:
 
 @mcp.tool()
 def config() -> dict[str, Any]:
-    """Show resolved config (subdomain, student id, persona, school year)."""
+    """Show resolved config (school, student, persona, school year, timezone)."""
     client = _get_client()
     return {
         "subdomain": client.subdomain or "",
@@ -117,6 +135,7 @@ def config() -> dict[str, Any]:
         or "(unset — set MSA_STUDENT_ID; most tools will fail without it)",
         "persona_id": _persona_id(),
         "school_year": _school_year(),
+        "timezone": _school_timezone().key,
         "env_file": str(_ENV_PATH) if _ENV_PATH else None,
     }
 
@@ -127,8 +146,9 @@ async def cookie_refresh() -> dict[str, Any]:
 
     Drives a fresh Microsoft OAuth login using SCHOOL_EMAIL / SCHOOL_PASS
     from the environment, writes the new cookie to MSA_COOKIES_FILE (or the
-    default ~/.myschoolapp-mcp/cookie.txt), then drops the cached HTTP
-    client so subsequent tool calls use the new cookie.
+    default ~/.myschoolapp-mcp/cookie.txt), then replaces the cached HTTP
+    client using that file even when MSA_COOKIE is set. A failed refresh
+    keeps the existing client; environment defaults remain unchanged.
 
     Use this when other tools start returning HTML or 401/403 — i.e. when
     the cookie has expired.
@@ -139,13 +159,21 @@ async def cookie_refresh() -> dict[str, Any]:
     fail; in that case, refresh on a trusted machine and copy the cookie
     file over.
     """
+    global _client
     from .auth import refresh_cookie
+    from .client import _load_cookies_from_file
 
     # refresh_cookie() uses Playwright's sync API, which cannot run inside
     # the asyncio event loop the MCP server runs us in. Offload to a worker
     # thread.
     path = await asyncio.to_thread(refresh_cookie)
-    _drop_client()
+    fresh_client = MyschoolappClient(cookies=_load_cookies_from_file(path))
+    with _client_lock:
+        previous_client = _client
+        _client = fresh_client
+        if previous_client is not None:
+            with contextlib.suppress(Exception):
+                previous_client.close()
     return {"ok": True, "cookie_path": str(path)}
 
 
@@ -205,7 +233,7 @@ def assignments(
             )
 
     client = _get_client()
-    today = date.today()
+    today = _today()
     days_back = 180 if "PastBeforeLastWeek" in wanted else 21
     common = {
         "format": "json",
@@ -367,10 +395,12 @@ def assignments_in_range(
         status_list: Comma-separated assignment status filter.
         section_list: Comma-separated section ids.
     """
-    if not date_start:
-        date_start = date.today().isoformat()
-    if not date_end:
-        date_end = (date.today() + timedelta(days=30)).isoformat()
+    if not date_start or not date_end:
+        today = _today()
+        if not date_start:
+            date_start = today.isoformat()
+        if not date_end:
+            date_end = (today + timedelta(days=30)).isoformat()
     return _get_client().request(
         "GET",
         "/api/DataDirect/AssignmentCenterAssignments/",
@@ -405,11 +435,9 @@ def assignment_options() -> dict[str, Any]:
 def _absolute_url(client: MyschoolappClient, url: Any) -> str | None:
     if not isinstance(url, str) or not url:
         return None
-    if url.startswith(("http://", "https://")):
+    if urlsplit(url).scheme:
         return url
-    if url.startswith("/"):
-        return f"{client.base_url}{url}"
-    return f"{client.base_url}/{url}"
+    return urljoin(f"{client.base_url}/", url)
 
 
 def _submission_method(body: dict[str, Any]) -> str | None:
@@ -445,6 +473,29 @@ def _clean_submission(client: MyschoolappClient, s: dict[str, Any]) -> dict[str,
     if s.get("Detail"):
         out["detail"] = s["Detail"]
     return out
+
+
+def _response_succeeded(response: dict[str, Any]) -> bool:
+    status = response.get("status")
+    return (
+        isinstance(status, int)
+        and 200 <= status < 300
+        and not response.get("error")
+    )
+
+
+def _request_assignment_component(
+    client: MyschoolappClient, path: str, params: dict[str, Any]
+) -> dict[str, Any]:
+    try:
+        return client.request("GET", path, params=params)
+    except (httpx.HTTPError, RuntimeError, RequestBoundaryError) as exc:
+        return {
+            "status": None,
+            "error": f"Component transport failure: {type(exc).__name__}",
+            "url": path,
+            "body": None,
+        }
 
 
 @mcp.tool()
@@ -493,19 +544,26 @@ def assignment_detail(
         },
     )
 
+    if not _response_succeeded(detail):
+        return {"detail": detail}
+
     rubric_resp: dict[str, Any] | None = None
     rubric_results_resp: dict[str, Any] | None = None
     if include_rubric:
         body = detail.get("body") if isinstance(detail, dict) else None
         rubric_id = body.get("RubricId") if isinstance(body, dict) else None
-        if rubric_id:
-            rubric_resp = client.request(
-                "GET",
+        try:
+            rubric_id = int(rubric_id)
+        except (TypeError, ValueError):
+            rubric_id = 0
+        if rubric_id > 0:
+            rubric_resp = _request_assignment_component(
+                client,
                 "/api/Rubric/AssignmentRubric/",
                 params={"id": str(rubric_id)},
             )
-            rubric_results_resp = client.request(
-                "GET",
+            rubric_results_resp = _request_assignment_component(
+                client,
                 "/api/Rubric/RubricResultsGet/",
                 params={"assignmentIndexId": aid, "studentId": sid},
             )
@@ -584,7 +642,7 @@ def assignment_detail(
             else None
         )
         rubric_out: dict[str, Any] = {}
-        if isinstance(rb_body, dict):
+        if _response_succeeded(rubric_resp) and isinstance(rb_body, dict):
             rubric_out = {
                 "id": rb_body.get("RubricId") or body.get("RubricId"),
                 "name": rb_body.get("Name"),
@@ -616,7 +674,9 @@ def assignment_detail(
         else:
             rubric_out = {"raw": rubric_resp}
 
-        if isinstance(results_body, list):
+        if not _response_succeeded(rubric_results_resp):
+            rubric_out["results_error"] = rubric_results_resp
+        elif isinstance(results_body, list):
             rubric_out["results"] = [
                 {
                     "criterion": r.get("SkillName") or r.get("Name"),
@@ -629,7 +689,7 @@ def assignment_detail(
         elif isinstance(results_body, dict):
             rubric_out["results"] = results_body
         else:
-            rubric_out["results"] = []
+            rubric_out["results_error"] = rubric_results_resp
 
         out["rubric"] = rubric_out
 
@@ -657,7 +717,10 @@ def schedule(on_date: str | None = None, full: bool = False) -> dict[str, Any]:
     resp = _get_client().request(
         "GET",
         "/api/schedule/MyDayCalendarStudentList/",
-        params={"scheduleDate": mdy(on_date), "personaId": _persona_id()},
+        params={
+            "scheduleDate": mdy(on_date or _today().isoformat()),
+            "personaId": _persona_id(),
+        },
     )
     if full or resp.get("error") or not isinstance(resp.get("body"), list):
         return resp
@@ -676,7 +739,7 @@ def daily_announcement(on_date: str | None = None) -> dict[str, Any]:
         "GET",
         "/api/schedule/ScheduleCurrentDayAnnouncmentParentStudent/",
         params={
-            "mydayDate": mdy(on_date),
+            "mydayDate": mdy(on_date or _today().isoformat()),
             "viewerId": _student_id(),
             "viewerPersonaId": _persona_id(),
         },
@@ -689,7 +752,7 @@ def daily_announcement(on_date: str | None = None) -> dict[str, Any]:
 
 
 @mcp.tool()
-def student_terms() -> dict[str, Any]:
+def student_terms(school_year: str | None = None) -> dict[str, Any]:
     """List the student's terms (durations) for the school year.
 
     Each row has DurationId + DurationDescription (e.g. "Year Long",
@@ -698,23 +761,29 @@ def student_terms() -> dict[str, Any]:
     (1 = term is currently active). DurationId values feed `classes`,
     `gradebook`, and `group_membership`; those tools auto-resolve the
     current term for their offering type when omitted. Community uses 0.
+
+    Args:
+        school_year: Exact label from `school_years()`. None uses
+            MSA_SCHOOL_YEAR or the date-derived school year.
     """
     return _get_client().request(
         "GET",
         "/api/DataDirect/StudentGroupTermList/",
         params={
             "studentUserId": _student_id(),
-            "schoolYearLabel": _school_year(),
+            "schoolYearLabel": _school_year() if school_year is None else school_year,
             "personaId": _persona_id(),
         },
     )
 
 
-def _resolve_duration_id(offering_type: int = 1) -> int:
+def _resolve_duration_id(
+    offering_type: int = 1, school_year: str | None = None
+) -> int:
     """Pick the current term for an offering type (academics by default)."""
-    resp = student_terms()
+    resp = student_terms() if school_year is None else student_terms(school_year)
     body = resp.get("body")
-    if resp.get("error") or not isinstance(body, list):
+    if not _response_succeeded(resp) or not isinstance(body, list):
         raise RuntimeError(
             f"Could not auto-resolve duration_id (status {resp.get('status')}). "
             "Pass duration_id explicitly — see student_terms()."
@@ -735,13 +804,15 @@ def _resolve_duration_id(offering_type: int = 1) -> int:
     return int(current[0]["DurationId"])
 
 
-def _fetch_classes(duration_id: int, marking_period_id: str = "") -> dict[str, Any]:
+def _fetch_classes(
+    duration_id: int, marking_period_id: str = "", school_year: str | None = None
+) -> dict[str, Any]:
     return _get_client().request(
         "GET",
         "/api/datadirect/ParentStudentUserClassesGet",
         params={
             "userId": _student_id(),
-            "schoolYearLabel": _school_year(),
+            "schoolYearLabel": _school_year() if school_year is None else school_year,
             "memberLevel": 3,
             "persona": _persona_id(),
             "durationList": duration_id,
@@ -752,7 +823,10 @@ def _fetch_classes(duration_id: int, marking_period_id: str = "") -> dict[str, A
 
 @mcp.tool()
 def classes(
-    duration_id: int = 0, marking_period_id: str = "", full: bool = False
+    duration_id: int = 0,
+    marking_period_id: str = "",
+    full: bool = False,
+    school_year: str | None = None,
 ) -> dict[str, Any]:
     """List classes for a term (duration).
 
@@ -767,10 +841,21 @@ def classes(
         marking_period_id: Optional marking-period filter.
         full: True = return the raw, untrimmed response (large; includes
             HTML course descriptions).
+        school_year: Exact label from `school_years()`. None uses the configured
+            or date-derived year. If that year has no current term, supply a
+            duration_id from `student_terms(school_year=...)`.
     """
     if not duration_id:
-        duration_id = _resolve_duration_id()
-    resp = _fetch_classes(duration_id, marking_period_id)
+        duration_id = (
+            _resolve_duration_id()
+            if school_year is None
+            else _resolve_duration_id(school_year=school_year)
+        )
+    resp = (
+        _fetch_classes(duration_id, marking_period_id)
+        if school_year is None
+        else _fetch_classes(duration_id, marking_period_id, school_year=school_year)
+    )
     if full or resp.get("error") or not isinstance(resp.get("body"), list):
         return resp
     resp["body"] = [compact_class(c) for c in resp["body"]]
@@ -783,6 +868,7 @@ def gradebook(
     duration_id: int = 0,
     section_ids: list[int] | None = None,
     full: bool = False,
+    school_year: str | None = None,
 ) -> dict[str, Any]:
     """Get current-marking-period and year-to-date grades for each class.
 
@@ -798,6 +884,8 @@ def gradebook(
             Pass None / omit to include all classes in the duration.
         full: True = also include the full per-section `hydrategradebook`
             response (heavy — ~30 KB per class).
+        school_year: Optional exact school-year label. Historical years
+            without an active term require an explicit duration_id.
 
     Returns body as a list of:
         {
@@ -806,7 +894,7 @@ def gradebook(
           "teacher": str,
           "marking_period": str,          # e.g. "3rd Trimester"
           "marking_period_id": int,
-          "graded": bool,                 # False = free period, non-graded block
+          "graded": bool,                 # has usable gradebook identifiers
           "current_grade": float | None,  # SectionGrade
           "current_grade_display": str | None,    # "85.39%"
           "year_grade": float | None,     # SectionGradeYear
@@ -816,14 +904,24 @@ def gradebook(
     client = _get_client()
     student_id = _student_id()
     if not duration_id:
-        duration_id = _resolve_duration_id()
+        duration_id = (
+            _resolve_duration_id()
+            if school_year is None
+            else _resolve_duration_id(school_year=school_year)
+        )
 
-    classes_resp = _fetch_classes(duration_id)
-    if classes_resp.get("error") or not isinstance(classes_resp.get("body"), list):
+    classes_resp = (
+        _fetch_classes(duration_id)
+        if school_year is None
+        else _fetch_classes(duration_id, school_year=school_year)
+    )
+    if not _response_succeeded(classes_resp) or not isinstance(
+        classes_resp.get("body"), list
+    ):
         return classes_resp
 
     classes_list = classes_resp["body"]
-    if section_ids:
+    if section_ids is not None:
         wanted = {int(s) for s in section_ids}
         classes_list = [
             c for c in classes_list if int(c.get("leadsectionid") or 0) in wanted
@@ -836,6 +934,7 @@ def gradebook(
         # Non-graded blocks (health/wellness, free periods, etc.) have no
         # markingperiodid — not an error, just nothing to fetch.
         is_graded = bool(lead_section_id and marking_period_id)
+        class_grade = compact_class(c).get("current_grade")
         row: dict[str, Any] = {
             "section_id": lead_section_id,
             "class": c.get("sectionidentifier"),
@@ -843,8 +942,9 @@ def gradebook(
             "marking_period": c.get("currentterm"),
             "marking_period_id": marking_period_id,
             "graded": is_graded,
-            "current_grade": to_float(c.get("cumgrade")),
-            "current_grade_display": fmt_pct(c.get("cumgrade")),
+            "hydration_verified": False,
+            "current_grade": class_grade,
+            "current_grade_display": fmt_pct(class_grade),
             "year_grade": None,
             "year_grade_display": None,
         }
@@ -853,53 +953,76 @@ def gradebook(
             out.append(row)
             continue
 
-        hydra = client.request(
-            "GET",
-            "/api/gradebook/hydrategradebook",
-            params={
-                "sectionId": lead_section_id,
-                "markingPeriodId": marking_period_id,
-                "sortAssignmentId": "null",
-                "sortSkillPk": "null",
-                "sortDesc": "null",
-                "sortCumulative": "null",
-                "studentUserId": student_id,
-                "fromProgress": "true",
-            },
-        )
+        try:
+            hydra = client.request(
+                "GET",
+                "/api/gradebook/hydrategradebook",
+                params={
+                    "sectionId": lead_section_id,
+                    "markingPeriodId": marking_period_id,
+                    "sortAssignmentId": "null",
+                    "sortSkillPk": "null",
+                    "sortDesc": "null",
+                    "sortCumulative": "null",
+                    "studentUserId": student_id,
+                    "fromProgress": "true",
+                },
+            )
+        except (httpx.HTTPError, RuntimeError, RequestBoundaryError) as exc:
+            hydra = {
+                "status": None,
+                "error": f"hydrategradebook transport failure: {type(exc).__name__}",
+                "body": None,
+            }
         body = hydra.get("body")
-        if isinstance(body, dict):
-            roster = body.get("Roster") or []
+        if _response_succeeded(hydra) and isinstance(body, dict):
+            roster = body.get("Roster")
+            if not isinstance(roster, list):
+                roster = []
             me = next(
                 (
                     r
                     for r in roster
-                    if str(r.get("StudentUserId") or "") == str(student_id)
+                    if isinstance(r, dict)
+                    and str(r.get("StudentUserId")) == str(student_id)
                 ),
                 None,
             )
-            if me is None and len(roster) == 1:
-                me = roster[0]
             if me is not None:
+                row["hydration_verified"] = True
                 # SectionGrade from hydrategradebook is authoritative; fall
-                # back to cumgrade if it's zero/null.
+                # back to cumgrade only if it's missing, preserving real zero.
                 sg = to_float(me.get("SectionGrade"))
                 if sg is not None:
                     row["current_grade"] = sg
                     row["current_grade_display"] = fmt_pct(sg)
-                row["year_grade"] = to_float(me.get("SectionGradeYear"))
-                row["year_grade_display"] = fmt_pct(me.get("SectionGradeYear"))
-            elif roster:
+                # This endpoint uses year zero as an unpublished-grade marker;
+                # unlike current grades, no year display field disambiguates it.
+                year_grade = to_float(me.get("SectionGradeYear"))
+                row["year_grade"] = None if year_grade == 0 else year_grade
+                row["year_grade_display"] = fmt_pct(row["year_grade"])
+            else:
                 row["error"] = "student not found in gradebook roster"
+                row["hydrate_error"] = hydra
         else:
             row["error"] = f"hydrategradebook status {hydra.get('status')}"
+            row["hydrate_error"] = hydra
 
         if full:
             row["hydrate"] = body
 
         out.append(row)
 
-    return {"status": 200, "duration_id": duration_id, "body": out}
+    result = {"status": 200, "duration_id": duration_id, "body": out}
+    failures = [row for row in out if row.get("error")]
+    if failures:
+        partial = len(failures) < len(out)
+        result.update(
+            status=207 if partial else 502,
+            error=f"Could not verify gradebook for {len(failures)} section(s)",
+            partial=partial,
+        )
+    return result
 
 
 @mcp.tool()
@@ -955,35 +1078,46 @@ def report_card_templates(school_year: str | None = None) -> dict[str, Any]:
 
 
 @mcp.tool()
-def transcript_templates() -> dict[str, Any]:
-    """List transcript templates available for the current school year."""
+def transcript_templates(school_year: str | None = None) -> dict[str, Any]:
+    """List transcript templates for an available school-year label.
+
+    school_year defaults to MSA_SCHOOL_YEAR or the date-derived school year.
+    """
     return _get_client().request(
         "GET",
         "/api/Grading/StudentTranscriptTemplateList",
-        params={"studentId": _student_id(), "schoolYearLabel": _school_year()},
+        params={
+            "studentId": _student_id(),
+            "schoolYearLabel": _school_year() if school_year is None else school_year,
+        },
     )
 
 
 @mcp.tool()
-def attendance() -> dict[str, Any]:
-    """Get attendance records for the current school year."""
+def attendance(school_year: str | None = None) -> dict[str, Any]:
+    """Get attendance records for an available school-year label.
+
+    school_year defaults to MSA_SCHOOL_YEAR or the date-derived school year.
+    """
     return _get_client().request(
         "GET",
         "/api/datadirect/ParentStudentUserAttendance/",
         params={
             "userId": _student_id(),
             "personaId": _persona_id(),
-            "schoolYearLabel": _school_year(),
+            "schoolYearLabel": _school_year() if school_year is None else school_year,
         },
     )
 
 
 @mcp.tool()
-def conduct(level_num: int = 0) -> dict[str, Any]:
+def conduct(level_num: int = 0, school_year: str | None = None) -> dict[str, Any]:
     """Get conduct records.
 
     Args:
         level_num: Conduct level filter (0 = all).
+        school_year: Exact label from `school_years()`. None uses
+            MSA_SCHOOL_YEAR or the date-derived school year.
     """
     return _get_client().request(
         "GET",
@@ -991,7 +1125,7 @@ def conduct(level_num: int = 0) -> dict[str, Any]:
         params={
             "studentUserId": _student_id(),
             "viewerPersonaId": _persona_id(),
-            "schoolYearLabel": _school_year(),
+            "schoolYearLabel": _school_year() if school_year is None else school_year,
             "levelNum": level_num,
         },
     )
@@ -1001,6 +1135,28 @@ def conduct(level_num: int = 0) -> dict[str, Any]:
 def grade_levels() -> dict[str, Any]:
     """List the student's grade-level history."""
     return _get_client().request("GET", "/api/datadirect/StudentGradeLevelList/")
+
+
+@mcp.tool()
+def school_years() -> dict[str, Any]:
+    """List enrolled/available school-year labels from grade_levels().
+
+    Labels retain their exact spelling and source order, with duplicates
+    removed. They may include historical, current, and future school years.
+    """
+    response = grade_levels()
+    body = response.get("body")
+    if (
+        not _response_succeeded(response)
+        or not isinstance(body, list)
+        or any(
+            not isinstance(row, dict) or not isinstance(row.get("SchoolYearLabel"), str)
+            for row in body
+        )
+    ):
+        return response
+    labels = list(dict.fromkeys(row["SchoolYearLabel"] for row in body))
+    return {**response, "body": labels}
 
 
 # ---------------------------------------------------------------------------
@@ -1018,7 +1174,9 @@ _GROUP_ENDPOINTS: dict[str, tuple[str, str, int]] = {
 
 
 @mcp.tool()
-def group_membership(kind: str, duration_id: int = 0) -> dict[str, Any]:
+def group_membership(
+    kind: str, duration_id: int = 0, school_year: str | None = None
+) -> dict[str, Any]:
     """List the student's group memberships of a given kind.
 
     Args:
@@ -1026,6 +1184,9 @@ def group_membership(kind: str, duration_id: int = 0) -> dict[str, Any]:
         duration_id: A DurationId from `student_terms()`. 0 / omitted =
             auto-resolve the current term for this kind of group.
             Community defaults to 0 (school-wide), without a term lookup.
+        school_year: Exact label from `school_years()`. None uses the configured
+            or date-derived year. If that year has no current term, supply a
+            duration_id from `student_terms(school_year=...)`.
     """
     if kind not in _GROUP_ENDPOINTS:
         raise ValueError(
@@ -1033,13 +1194,17 @@ def group_membership(kind: str, duration_id: int = 0) -> dict[str, Any]:
         )
     endpoint, dur_param, offering_type = _GROUP_ENDPOINTS[kind]
     if not duration_id and kind != "community":
-        duration_id = _resolve_duration_id(offering_type)
+        duration_id = (
+            _resolve_duration_id(offering_type)
+            if school_year is None
+            else _resolve_duration_id(offering_type, school_year=school_year)
+        )
     return _get_client().request(
         "GET",
         f"/api/datadirect/{endpoint}",
         params={
             "userId": _student_id(),
-            "schoolYearLabel": _school_year(),
+            "schoolYearLabel": _school_year() if school_year is None else school_year,
             "memberLevel": 3,
             "persona": _persona_id(),
             dur_param: duration_id,
@@ -1088,6 +1253,40 @@ def calendar_list(
 
 
 @mcp.tool()
+def calendar_events(
+    date_start: str,
+    date_end: str,
+    calendar_ids: list[str] | None = None,
+    include_practice: bool = False,
+    full: bool = False,
+) -> dict[str, Any]:
+    """Read school, group, and athletic calendar events in a date range.
+
+    This uses the site's read-only events POST; it never creates events or
+    saves calendar preferences. Assignments and class/admissions schedules
+    are separate: use assignments or schedule for those.
+
+    Args:
+        date_start: Exact YYYY-MM-DD school-local start date.
+        date_end: Exact YYYY-MM-DD school-local end date; boundaries are
+            passed through without an inclusive/exclusive adjustment.
+        calendar_ids: Child CalendarId values from calendar_list(). None
+            uses currently selected supported filters. [] requests nothing.
+            Explicit visible IDs affect this request only, not saved settings.
+        include_practice: Include practice events (default False).
+        full: Return raw rows without compaction or deduplication. Compact
+            output preserves local dates and merges duplicate event groups;
+            count and raw_count describe the returned and original row counts.
+    """
+    from .calendar_tools import fetch_calendar_events
+
+    return fetch_calendar_events(
+        _get_client(), date_start, date_end,
+        calendar_ids=calendar_ids, include_practice=include_practice, full=full,
+    )
+
+
+@mcp.tool()
 def calendar_actions(calendar_set_id: int = 1) -> dict[str, Any]:
     """Get calendar metadata (available filters and feeds)."""
     return _get_client().request(
@@ -1122,7 +1321,7 @@ def official_notes(
         search_text: Free-text search.
     """
     if not to_date:
-        to_date = date.today().isoformat()
+        to_date = _today().isoformat()
     return _get_client().request(
         "GET",
         "/api/officialnote/InboxExternal/",
@@ -1178,6 +1377,22 @@ def activity_feed(last_date_ticks: str = "") -> dict[str, Any]:
 
 
 @mcp.tool()
+def directory_list() -> dict[str, Any]:
+    """List available directories (DirectoryID, SortOrder, DirectoryName).
+
+    Returns only Directories and response metadata, without session context
+    or directory members. Use the IDs with the other directory tools.
+    """
+    response = _get_client().request("GET", "/api/webapp/context")
+    body = response.get("body")
+    directories = body.get("Directories") if isinstance(body, dict) else None
+    result = {**response, "body": directories}
+    if not isinstance(directories, list):
+        result["error"] = response.get("error") or "Expected a Directories list."
+    return result
+
+
+@mcp.tool()
 def directory_search(
     directory_id: int,
     query: str = "",
@@ -1195,9 +1410,7 @@ def directory_search(
     `total_results` so you can tell when the cap kicked in.
 
     Args:
-        directory_id: Numeric directory id (school-specific; e.g. 397 =
-            Faculty/Staff on the deployment this was built against). Find
-            yours via `directory_info` / DevTools.
+        directory_id: Numeric directory id from `directory_list()`.
         query: Free-text search.
         facets: Encoded facet filter from `directory_facets()`.
         search_all: Match across all facets.

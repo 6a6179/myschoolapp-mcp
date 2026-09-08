@@ -136,9 +136,13 @@ def refresh_cookie() -> Path:
             browser.close()
             raise RuntimeError("Login flow did not reach the app homepage.") from e
 
+        # Let the browser apply domain/path/secure cookie matching for the
+        # school origin; identity-provider cookies must stay in the browser.
+        cookies = context.cookies([f"https://{subdomain}.myschoolapp.com"])
+        if not cookies:
+            browser.close()
+            raise RuntimeError("No cookies applicable to the school origin were found.")
         print("Login success.", file=sys.stderr)
-
-        cookies = context.cookies()
         cookie_string = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
         _write_private(cookie_path, cookie_string)
         print(f"Saved {len(cookies)} cookies to {cookie_path}", file=sys.stderr)

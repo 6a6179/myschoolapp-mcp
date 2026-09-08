@@ -196,10 +196,10 @@ class TestGradeParsing:
         assert fmt_pct(85.39) == "85.39%"
         assert fmt_pct("90.7") == "90.70%"
 
-    def test_zero_means_ungraded(self):
-        assert fmt_pct(0) is None
-        assert to_float(0) is None
-        assert to_float("0") is None
+    def test_zero_is_a_real_grade(self):
+        assert fmt_pct(0) == "0.00%"
+        assert to_float(0) == 0.0
+        assert to_float("0") == 0.0
 
     def test_empty_and_garbage(self):
         assert fmt_pct(None) is None

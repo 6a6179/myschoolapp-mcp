@@ -17,7 +17,7 @@ client.
 
 ## Features
 
-About 29 typed tools covering the common student/parent surfaces:
+Typed tools covering the common student/parent surfaces:
 
 - **Core** — `whoami`, `config`, `cookie_refresh`
 - **Assignments** — `assignments` (bucketed, compact by default),
@@ -31,18 +31,21 @@ About 29 typed tools covering the common student/parent surfaces:
   you don't pass a `duration_id`; gradebook returns both the current
   marking-period and year-to-date grade per class),
   `report_card_templates`, `transcript_templates`, `attendance`,
-  `conduct`, `grade_levels`
+  `conduct`, `grade_levels`, `school_years` (exact enrolled/available year labels)
 - **Groups** — `group_membership` (advisory / athletic / dorm /
   activity / community)
-- **Calendar** — `calendar_list`, `calendar_actions`
+- **Calendar** — `calendar_list`, `calendar_actions`, `calendar_events`
+  (read school, group, and athletic events without saving preferences)
 - **Inbox / news** — `official_notes`, `official_note_types`,
   `activity_feed`
-- **Directory** — `directory_search` (compact rows, capped at a `limit`
+- **Directory** — `directory_list` (available directory IDs and names),
+  `directory_search` (compact rows, capped at a `limit`
   so an empty query can't dump the whole school into your context),
   `directory_info`, `directory_facets`
 - **Escape hatch** — `api_request` for anything else. Requests are
-  pinned to your school's own host — absolute URLs pointing anywhere
-  else are rejected so the session cookie can't leak.
+  pinned to your school's own HTTPS host, including every redirect.
+  Off-site, subdomain, and HTTP destinations are rejected before sending
+  a request; loaded session cookies are marked Secure.
 
 ## Install
 
@@ -74,8 +77,16 @@ You need at least:
 Optional:
 
 - `MSA_PERSONA_ID` — 2 = student (default), 3 = parent.
-- `MSA_SCHOOL_YEAR` — auto-derived from today's date if unset
+- `MSA_SCHOOL_YEAR` — auto-derived from the school-local date if unset
   (e.g. `2025 - 2026`).
+- `MSA_TIMEZONE` — IANA timezone used for today's date, default date
+  ranges, assignment due-date buckets, and school-year inference. Defaults
+  to `UTC`; set, for example, `America/New_York` for a school in that
+  timezone. `config()` includes the resolved `timezone`. Invalid or
+  unavailable timezone names raise a `ValueError` identifying
+  `MSA_TIMEZONE`; use a name available in the host's IANA timezone data.
+  Explicit date arguments remain unchanged. `schedule()` and
+  `daily_announcement()` send the school-local date when no date is given.
 
 ### Cookie
 
@@ -99,8 +110,13 @@ This drives Microsoft OAuth login via Playwright and saves the
 resulting cookies. **2FA / MFA accounts are not supported by this
 flow.** When the cookie expires (typically every few weeks), just run
 it again — or call the `cookie_refresh` tool from your MCP client, which
-does the same thing and then drops the cached HTTP client so subsequent
-calls pick up the fresh cookie.
+does the same thing and then replaces the cached HTTP client so subsequent
+calls pick up the fresh cookie. The tool uses the newly written file even
+when `MSA_COOKIE` was set; a failed refresh retains the prior cached session
+and cookie configuration. A later server restart uses the precedence
+listed above again, so remove or update a stale `MSA_COOKIE` in your launch
+configuration. The export includes only cookies applicable to the school's
+HTTPS origin, using Playwright's domain-aware selection.
 
 If 2FA is on, log in to the site in a normal browser, export your
 cookies with any standard cookie-export extension, and point
@@ -147,6 +163,46 @@ installed package to the project root. If your client launches it from
 an unrelated working directory, copy your `.env` to
 `~/.myschoolapp-mcp/.env`.
 
+## School years and directories
+
+`school_years()` returns de-duplicated, exact `SchoolYearLabel` strings
+from `grade_levels()`, with the source response metadata. These are the
+student's enrolled/available year labels and can include historical,
+current, and future years; strings are not parsed or normalized.
+
+Pass `school_year="2025 - 2026"` to `student_terms`, `classes`, `gradebook`,
+`attendance`, `conduct`, `group_membership`, `transcript_templates`, or
+`report_card_templates` to query that year without changing configuration.
+Omitting it keeps the configured/inferred default. `classes`, `gradebook`,
+and `group_membership` resolve durations within the requested year. If
+that year has no current term, use `student_terms(school_year=...)` and
+pass an explicit `duration_id`; the tools do not guess a historical term.
+Community membership keeps its school-wide duration of `0` without a term lookup.
+
+`directory_list()` reads `/api/webapp/context` and returns only its
+`Directories` entries plus response metadata. Entries retain
+`DirectoryID`, `SortOrder`, and `DirectoryName`; use those IDs with
+`directory_search`, `directory_info`, and `directory_facets`. It does not
+fetch directory members or return the rest of the session context.
+
+## Calendar events
+
+`calendar_events(date_start="2026-09-07", date_end="2026-09-14")` reads
+school, group, and athletic events using the currently selected supported
+calendar filters. Dates must be exact `YYYY-MM-DD`; they are sent unchanged,
+without assuming an inclusive/exclusive end-date adjustment.
+
+For an explicit request-only selection, pass child `CalendarId` values from
+`calendar_list()` as `calendar_ids`. `None` uses selected filters; `[]`
+returns no events. `include_practice=True` includes practice events.
+This calls the UI's events read POST and never persists filter preferences.
+It excludes assignment, class-schedule, and admissions-calendar routes.
+
+Compact output preserves local timestamp strings and event links and merges
+duplicate event groups. `count` is the compact count; `raw_count` is the
+original row count. `full=True` preserves the raw event rows instead.
+Upstream failures retain their status/error information.
+
 ## Report cards
 
 `report_card_templates(school_year="2025 - 2026")` selects a school-year
@@ -168,13 +224,31 @@ a fallback. This lists report metadata, not report document contents.
 
 ## Caveats
 
-- Some tools return school-specific IDs (`categoryId` for official
+- `assignment_detail` retains failed detail responses under `detail`.
+  Rubric failures retain their response wrappers under `rubric.raw` or
+  `rubric.results_error`, alongside any successful assignment/rubric
+  components. Nonpositive rubric IDs skip rubric requests.
+- `gradebook` reports per-section `error` and `hydrate_error` wrappers
+  when hydration fails or the requested student cannot be found. It
+  retains other classes and marks `hydration_verified` only after finding
+  the requested student. Aggregate status is `207` for partial results
+  and `502` when all returned sections fail, with `error` and `partial`
+  fields. Fallback class-list grades remain unverified. Hydrated current
+  zero grades remain `0.00%`; a class-list zero with no display remains
+  the existing no-grade placeholder. `SectionGradeYear=0` is used by
+  this endpoint for unpublished year-to-date grades and remains null.
+  Historical class lists can omit marking-period IDs; those rows cannot be
+  hydrated and `graded=False` means no usable gradebook identifiers were
+  returned, not proof that the historical class was ungraded. Use report
+  cards for published historical results when this endpoint supplies no grades.
+- Some tools use school-specific IDs (`categoryId` for official
   notes, `directoryId` for directories). The defaults in this repo
-  match Tabor Academy; yours may differ. Open DevTools and check.
+  match Tabor Academy; yours may differ. Use `directory_list()` for
+  directory IDs and DevTools for other IDs.
 - `calendar_list` returns the user's calendar *definitions* (names,
   colors, filters) — not events, despite taking a date range. That's
-  what the underlying endpoint actually does. Use `schedule` /
-  `assignments` for day-to-day items.
+  what the underlying endpoint actually does. Use `calendar_events` for
+  school/group/athletic events; `schedule` / `assignments` remain separate.
 - The `assignments` and `classes` tools strip heavy fields (HTML course
   descriptions, photo metadata, the full historical assignment bucket)
   by default to stay within token budgets. Pass `full=True` for the raw
@@ -182,9 +256,10 @@ a fallback. This lists report metadata, not report document contents.
 - The Microsoft OAuth selectors in `auth.py` can break if Microsoft
   changes the login UI. If it stops working, set `HEADLESS=False` in
   `.env` and watch what happens.
-- Read-only by design. The tools that exist all map to GET endpoints.
-  Use `api_request` if you want to POST something, but consider whether
-  you really want an LLM submitting forms on your behalf.
+- Typed school-data tools are read-only. `calendar_events` uses the site's
+  read POST without creating events or saving preferences. `cookie_refresh`
+  signs in and writes a local cookie file. The existing `api_request`
+  escape hatch supports arbitrary HTTP methods and is not read-only.
 
 ## Development
 
@@ -194,8 +269,9 @@ ruff check src tests
 pytest
 ```
 
-The tests cover the pure formatting/parsing helpers and the client's
-cookie parsing and URL gating — no live session needed.
+The tests use synthetic fixtures, mocked server responses, HTTPX
+`MockTransport`, and a fake Playwright context. Server/auth imports patch
+environment-file loading before import; no live session is needed.
 `scripts/probe_api.py` opens a headed browser and streams every `/api/`
 request the SPA makes to `scripts/capture.jsonl`; that's how these
 endpoints were mapped in the first place.

@@ -18,6 +18,10 @@ _EXPIRED_COOKIE_HINT = (
 )
 
 
+class RequestBoundaryError(ValueError):
+    """A prepared HTTP request was blocked by the school's URL boundary."""
+
+
 class MyschoolappClient:
     def __init__(
         self,
@@ -34,13 +38,15 @@ class MyschoolappClient:
         self.base_url = f"https://{self.subdomain}.myschoolapp.com"
         self._host = f"{self.subdomain}.myschoolapp.com".lower()
 
-        cookie_dict = _load_cookies(cookies)
+        cookie_dict = _load_cookies(cookies, allowed_host=self._host)
 
         # Scope every cookie to the school host. A plain dict jar in httpx
         # is domain-unscoped and would happily be sent to any absolute URL.
         jar = httpx.Cookies()
         for name, value in cookie_dict.items():
             jar.set(name, value, domain=self._host)
+        for cookie in jar.jar:
+            cookie.secure = True
 
         self._client = httpx.Client(
             base_url=self.base_url,
@@ -58,10 +64,18 @@ class MyschoolappClient:
             },
             timeout=timeout,
             follow_redirects=True,
+            event_hooks={"request": [self._validate_request]},
         )
 
     def _resolve_path(self, path: str) -> str:
         return resolve_request_path(path, self._host)
+
+    def _validate_request(self, request: httpx.Request) -> None:
+        # HTTPX runs request hooks before every send, including each redirect.
+        try:
+            self._resolve_path(str(request.url))
+        except ValueError as exc:
+            raise RequestBoundaryError(str(exc)) from exc
 
     def request(
         self,
@@ -194,7 +208,9 @@ def load_env_file() -> Path | None:
     return None
 
 
-def _load_cookies(cookies: dict[str, str] | str | None) -> dict[str, str]:
+def _load_cookies(
+    cookies: dict[str, str] | str | None, allowed_host: str | None = None
+) -> dict[str, str]:
     if isinstance(cookies, dict):
         return cookies
     if isinstance(cookies, str):
@@ -213,7 +229,7 @@ def _load_cookies(cookies: dict[str, str] | str | None) -> dict[str, str]:
     path_str = os.environ.get("MSA_COOKIES_FILE")
     path = Path(path_str) if path_str else default_cookie_path()
     if path.exists():
-        return _load_cookies_from_file(path)
+        return _load_cookies_from_file(path, allowed_host=allowed_host)
 
     raise RuntimeError(
         "No cookies provided. Either:\n"
@@ -236,7 +252,16 @@ def _parse_cookie_header(s: str) -> dict[str, str]:
     return out
 
 
-def _load_cookies_from_file(path: Path) -> dict[str, str]:
+def _cookie_domain_matches(domain: str | None, allowed_host: str | None) -> bool:
+    if not allowed_host or not domain:
+        return True  # Raw headers and older exports contain no scope metadata.
+    domain = domain.lstrip(".").lower()
+    return allowed_host == domain or allowed_host.endswith(f".{domain}")
+
+
+def _load_cookies_from_file(
+    path: Path, allowed_host: str | None = None
+) -> dict[str, str]:
     text = path.read_text(encoding="utf-8").strip()
     if not text:
         raise RuntimeError(f"Cookie file {path} is empty.")
@@ -255,7 +280,10 @@ def _load_cookies_from_file(path: Path) -> dict[str, str]:
             out = {
                 str(entry["name"]): str(entry["value"])
                 for entry in data
-                if isinstance(entry, dict) and "name" in entry and "value" in entry
+                if isinstance(entry, dict)
+                and "name" in entry
+                and "value" in entry
+                and _cookie_domain_matches(entry.get("domain"), allowed_host)
             }
         else:
             raise RuntimeError(
@@ -265,10 +293,12 @@ def _load_cookies_from_file(path: Path) -> dict[str, str]:
         # Netscape cookies.txt: domain/flag/path/secure/expiry/name/value
         out = {}
         for line in text.splitlines():
+            if line.startswith("#HttpOnly_"):
+                line = line.removeprefix("#HttpOnly_")
             if not line or line.startswith("#"):
                 continue
             parts = line.split("\t")
-            if len(parts) >= 7:
+            if len(parts) >= 7 and _cookie_domain_matches(parts[0], allowed_host):
                 out[parts[5]] = parts[6]
     else:
         # Raw Cookie header format: "name=value; name2=value2; ..."
