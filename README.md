@@ -8,6 +8,7 @@ your account's permissions and the endpoints implemented here.
 
 Works with [Hermes Agent](https://hermes-agent.nousresearch.com/docs/),
 [Codex](https://github.com/openai/codex),
+[OpenClaw](https://docs.openclaw.ai/),
 [Claude Code](https://claude.com/claude-code), and any other MCP-aware
 client that supports stdio servers.
 
@@ -222,6 +223,51 @@ shows saved configuration, not a successful school login. The Codex IDE
 extension shares this configuration; restart the extension after editing
 it. See the [Codex MCP documentation](https://developers.openai.com/codex/mcp/)
 for more client options.
+
+### OpenClaw
+
+On an OpenClaw version with native MCP client support, register the server
+after configuring the school's authentication in `.env`:
+
+```bash
+openclaw mcp add myschoolapp \
+  --command /absolute/path/to/myschoolapp-mcp/.venv/bin/myschoolapp-mcp \
+  --env MSA_ENV_FILE=/absolute/path/to/myschoolapp-mcp/.env
+openclaw mcp doctor myschoolapp --probe
+```
+
+Alternatively, merge this into `~/.openclaw/openclaw.json`, preserving your
+other settings and servers:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "myschoolapp": {
+        "command": "/absolute/path/to/myschoolapp-mcp/.venv/bin/myschoolapp-mcp",
+        "env": {
+          "MSA_ENV_FILE": "/absolute/path/to/myschoolapp-mcp/.env"
+        }
+      }
+    }
+  }
+}
+```
+
+The probe checks server startup and MCP capabilities, not school login;
+ask the agent to call `whoami` to verify authenticated access. Restart the
+running OpenClaw gateway/agent after configuration changes as needed:
+`openclaw mcp reload` only clears caches in its own CLI process, not another
+running gateway. The `coding` and `messaging` tool profiles expose MCP
+tools; `minimal` or an explicit `bundle-mcp` deny rule can hide them.
+
+These instructions use OpenClaw's native `mcp.servers` registry, not
+mcporter's separate configuration. They follow the
+[official MCP documentation](https://docs.openclaw.ai/cli/mcp);
+OpenClaw-specific end-to-end testing is not part of the verification
+snapshot below.
+
+### Environment-file lookup
 
 The server looks for `.env` in this order: `$MSA_ENV_FILE`, current
 working directory, `~/.myschoolapp-mcp/.env`, then walking up from the
