@@ -7,8 +7,8 @@ your session cookie to call the website's private JSON APIs, subject to
 your account's permissions and the endpoints implemented here.
 
 Works with [Hermes Agent](https://hermes-agent.nousresearch.com/docs/),
-[Claude Code](https://claude.com/claude-code),
-[Claude Desktop](https://claude.ai/download), and any other MCP-aware
+[Codex](https://github.com/openai/codex),
+[Claude Code](https://claude.com/claude-code), and any other MCP-aware
 client that supports stdio servers.
 
 The typed school-data tools are read-only. Cookie refresh writes a local
@@ -194,22 +194,34 @@ Add to `~/.claude.json`:
 }
 ```
 
-### Claude Desktop
+### Codex
 
-Add to `claude_desktop_config.json` (location depends on your OS):
+With [Codex CLI](https://github.com/openai/codex) installed and the school's
+authentication configured in `.env`, register the stdio server:
 
-```json
-{
-  "mcpServers": {
-    "myschoolapp": {
-      "command": "/absolute/path/to/myschoolapp-mcp/.venv/bin/myschoolapp-mcp",
-      "env": {
-        "MSA_ENV_FILE": "/absolute/path/to/myschoolapp-mcp/.env"
-      }
-    }
-  }
-}
+```bash
+codex mcp add myschoolapp \
+  --env MSA_ENV_FILE=/absolute/path/to/myschoolapp-mcp/.env \
+  -- /absolute/path/to/myschoolapp-mcp/.venv/bin/myschoolapp-mcp
+codex mcp list
 ```
+
+Alternatively, add the equivalent configuration to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.myschoolapp]
+command = "/absolute/path/to/myschoolapp-mcp/.venv/bin/myschoolapp-mcp"
+
+[mcp_servers.myschoolapp.env]
+MSA_ENV_FILE = "/absolute/path/to/myschoolapp-mcp/.env"
+```
+
+Start a new Codex session and use `/mcp` to inspect the active connection,
+then ask it to call `whoami` to verify school access. `codex mcp list`
+shows saved configuration, not a successful school login. The Codex IDE
+extension shares this configuration; restart the extension after editing
+it. See the [Codex MCP documentation](https://developers.openai.com/codex/mcp/)
+for more client options.
 
 The server looks for `.env` in this order: `$MSA_ENV_FILE`, current
 working directory, `~/.myschoolapp-mcp/.env`, then walking up from the
