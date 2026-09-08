@@ -1,13 +1,18 @@
 # myschoolapp-mcp
 
-An MCP (Model Context Protocol) server for the Blackbaud K-12 platform
-that lives at `*.myschoolapp.com`. It uses your existing browser session
-cookie to call the same private JSON API that the SPA frontend calls,
-so anything you can see on the site, your LLM can see.
+An MCP (Model Context Protocol) server for Blackbaud K-12 schools at
+`*.myschoolapp.com`. Access assignments, grades, schedules, calendar events,
+report listings, and directories through **32 MCP tools**. The server uses
+your session cookie to call the website's private JSON APIs, subject to
+your account's permissions and the endpoints implemented here.
 
-Built for use with [Claude Code](https://claude.com/claude-code),
+Works with [Hermes Agent](https://hermes-agent.nousresearch.com/docs/),
+[Claude Code](https://claude.com/claude-code),
 [Claude Desktop](https://claude.ai/download), and any other MCP-aware
-client.
+client that supports stdio servers.
+
+The typed school-data tools are read-only. Cookie refresh writes a local
+session file; the generic `api_request` tool also supports write methods.
 
 > **Unofficial.** Not affiliated with Blackbaud. Endpoints were
 > reverse-engineered from network traffic on one school's deployment;
@@ -17,7 +22,7 @@ client.
 
 ## Features
 
-Typed tools covering the common student/parent surfaces:
+All 32 tools, grouped by purpose:
 
 - **Core** — `whoami`, `config`, `cookie_refresh`
 - **Assignments** — `assignments` (bucketed, compact by default),
@@ -29,7 +34,7 @@ Typed tools covering the common student/parent surfaces:
 - **Academics** — `student_terms`, `classes`, `gradebook` (both return
   compact per-class views and auto-resolve the current academic term if
   you don't pass a `duration_id`; gradebook returns both the current
-  marking-period and year-to-date grade per class),
+  marking-period and year-to-date grades when available),
   `report_card_templates`, `transcript_templates`, `attendance`,
   `conduct`, `grade_levels`, `school_years` (exact enrolled/available year labels)
 - **Groups** — `group_membership` (advisory / athletic / dorm /
@@ -49,14 +54,26 @@ Typed tools covering the common student/parent surfaces:
 
 ## Install
 
-Requires Python 3.10+.
+Requires Python 3.10+ and an authenticated school account. The commands
+below use a virtual environment on Linux/macOS; on Windows, activate
+`.venv\Scripts\Activate.ps1` instead.
 
 ```bash
 git clone https://github.com/6a6179/myschoolapp-mcp.git
 cd myschoolapp-mcp
-pip install -e .
-python -m playwright install chromium  # only needed for auto cookie refresh
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
 ```
+
+Only automatic cookie refresh needs a Playwright browser installation:
+
+```bash
+python -m playwright install chromium
+```
+
+If you import an existing browser cookie instead, skip that step. Browser
+system dependencies may also be needed on minimal Linux installations.
 
 ## Configure
 
@@ -64,7 +81,12 @@ Copy the template and fill it in:
 
 ```bash
 cp .env.example .env
+chmod 600 .env  # Linux/macOS
 ```
+
+Edit `.env` locally. Do not paste passwords or session cookies into chat
+or commit them to Git. Set `MSA_TIMEZONE` to your **school's** timezone,
+not necessarily the timezone of your computer or server.
 
 You need at least:
 
@@ -123,11 +145,37 @@ cookies with any standard cookie-export extension, and point
 `MSA_COOKIES_FILE` at the result.
 
 **Security note:** the cookie file is a full session credential and
-`.env` contains your actual password. The refresh script writes
+`.env` contains a login password if you configured automatic refresh.
+The refresh script writes
 `cookie.txt` with `0600` permissions (and the containing directory
 `0700`); if you create either file by hand, `chmod 600` it yourself.
 
 ## Register with an MCP client
+
+Use absolute paths to the installed executable and `.env`. A desktop app
+or gateway does not necessarily inherit your activated virtual environment
+or start in the repository directory. Replace `/absolute/path/to` below
+with your actual installation path.
+
+### Hermes Agent
+
+After configuring authentication:
+
+```bash
+hermes mcp add myschoolapp \
+  --command /absolute/path/to/myschoolapp-mcp/.venv/bin/myschoolapp-mcp \
+  --env MSA_ENV_FILE=/absolute/path/to/myschoolapp-mcp/.env
+hermes mcp test myschoolapp
+```
+
+The add command prompts for which tools to enable. A successful test
+confirms the connection and tool discovery; call `whoami` to check the
+school session and `config` to check the resolved year/timezone.
+
+For an already-running Hermes session, send `/reload-mcp` after adding
+the server or updating its source/configuration. This reconnects MCP
+servers without restarting the gateway. A separate CLI test does not
+refresh the running chat's connection.
 
 ### Claude Code
 
@@ -137,7 +185,10 @@ Add to `~/.claude.json`:
 {
   "mcpServers": {
     "myschoolapp": {
-      "command": "myschoolapp-mcp"
+      "command": "/absolute/path/to/myschoolapp-mcp/.venv/bin/myschoolapp-mcp",
+      "env": {
+        "MSA_ENV_FILE": "/absolute/path/to/myschoolapp-mcp/.env"
+      }
     }
   }
 }
@@ -151,7 +202,10 @@ Add to `claude_desktop_config.json` (location depends on your OS):
 {
   "mcpServers": {
     "myschoolapp": {
-      "command": "myschoolapp-mcp"
+      "command": "/absolute/path/to/myschoolapp-mcp/.venv/bin/myschoolapp-mcp",
+      "env": {
+        "MSA_ENV_FILE": "/absolute/path/to/myschoolapp-mcp/.env"
+      }
     }
   }
 }
@@ -160,8 +214,32 @@ Add to `claude_desktop_config.json` (location depends on your OS):
 The server looks for `.env` in this order: `$MSA_ENV_FILE`, current
 working directory, `~/.myschoolapp-mcp/.env`, then walking up from the
 installed package to the project root. If your client launches it from
-an unrelated working directory, copy your `.env` to
-`~/.myschoolapp-mcp/.env`.
+an unrelated working directory, set `MSA_ENV_FILE` explicitly as above
+or copy your `.env` to `~/.myschoolapp-mcp/.env`. On Windows, point the
+client to `.venv/Scripts/myschoolapp-mcp.exe` and use your absolute paths.
+
+## Example requests
+
+Ask your MCP client naturally:
+
+- "Show assignments due today and tomorrow, including their status."
+- "Show my current grades; distinguish unavailable grades from zeroes."
+- "What school events are on the calendar this week?"
+- "List the directories I can search."
+- "Which school years are available, and what reports can I list for one?"
+
+Equivalent tool-call examples (not shell commands):
+
+```text
+assignments(buckets="DueToday,DueTomorrow")
+gradebook()
+calendar_events(date_start="2026-09-07", date_end="2026-09-14")
+directory_list()
+school_years()
+```
+
+Use returned directory IDs with `directory_search`, and exact returned
+year labels with the historical-year arguments described below.
 
 ## School years and directories
 
@@ -263,10 +341,12 @@ a fallback. This lists report metadata, not report document contents.
 
 ## Development
 
+With the virtual environment activated:
+
 ```bash
-pip install -e '.[dev]'
-ruff check src tests
-pytest
+python -m pip install -e '.[dev]'
+python -m ruff check src tests
+python -m pytest -q
 ```
 
 The tests use synthetic fixtures, mocked server responses, HTTPX
@@ -275,6 +355,29 @@ environment-file loading before import; no live session is needed.
 `scripts/probe_api.py` opens a headed browser and streams every `/api/`
 request the SPA makes to `scripts/capture.jsonl`; that's how these
 endpoints were mapped in the first place.
+
+### Verification snapshot
+
+The upgrade in [`d84904b`](https://github.com/6a6179/myschoolapp-mcp/commit/d84904bb637440fdc828fed3c0b3fba90e373925)
+was verified against a Tabor Academy student account:
+
+- **449 offline tests passed**, plus Ruff and independent code review.
+- **All 32 tools were invoked through real MCP stdio across 52 calls**,
+  with no detected failures in that run. The executable was launched
+  from outside the repository using explicit configuration.
+- Calendar reads left saved calendar preferences unchanged. Login refresh
+  was tested with an isolated cookie file and a stale environment-cookie
+  override, followed by a successful authenticated read.
+- After reloading Hermes, direct chat-tool calls verified authentication,
+  configuration, all three new tools (`calendar_events`, `directory_list`,
+  `school_years`), assignments, and gradebook.
+
+This is coverage of the tested account and API paths, not a guarantee of
+every school's deployment. In particular, the tested historical term
+returned classes without usable gradebook marking-period IDs; numerical
+historical grades could not be hydrated through that route. Historical
+report-card **listing** worked. Empty endpoint results do not establish
+that records are absent, and report listing does not download PDFs.
 
 ## Credits
 
