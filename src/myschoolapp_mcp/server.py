@@ -223,6 +223,7 @@ def assignments(
     buckets: str = "",
     full: bool = False,
     days_ahead: int = 60,
+    with_points: bool = True,
 ) -> dict[str, Any]:
     """Get assignments grouped by due-date bucket (or by class).
 
@@ -243,9 +244,15 @@ def assignments(
 
     Each compact item includes assignment_id, assignment_index_id (pass to
     `assignment_detail`), section_id, class, title, type, assigned, due,
-    max_points, status (decode with `assignment_status_labels()`), missing,
-    late, incomplete, major, extra_credit, marking_period, has_grade, and
-    drop_box.
+    status (decode with `assignment_status_labels()`), missing, late,
+    incomplete, major, extra_credit, marking_period, has_grade, and drop_box.
+
+    The list endpoint carries no point values. With `with_points` (default
+    on) the tool also calls `hydrategradebook` once per (section, marking
+    period) present in the results and adds `max_points` plus, once graded,
+    `points_earned` to each item. Ungraded-book items (no marking period)
+    stay without points. A failed gradebook fetch never fails the list —
+    those items just lack the fields and `note` says which sections failed.
 
     Args:
         display_by_due_date: True = group by due-date bucket (default).
@@ -257,6 +264,8 @@ def assignments(
             back the fetch window reaches (PastBeforeLastWeek widens it).
         full: True = return the raw, untrimmed endpoint responses.
         days_ahead: How far forward to fetch (1-365, default 60).
+        with_points: False = skip the per-class gradebook calls (faster,
+            no max_points / points_earned).
     """
     if not 1 <= days_ahead <= 365:
         raise UserError("days_ahead must be between 1 and 365.")
@@ -402,9 +411,95 @@ def assignments(
     }
     if unbucketed:
         out["unbucketed"] = unbucketed
+    if with_points:
+        rows = [r for rows_ in out_buckets.values() for r in rows_]
+        rows += major + unbucketed
+        points_note = _attach_points(client, scan_items, rows)
+        if points_note:
+            note = f"{note}; {points_note}" if note else points_note
     if note:
         out["note"] = note
     return out
+
+
+def _attach_points(
+    client: MyschoolappClient,
+    raw_items: list[dict[str, Any]],
+    rows: list[dict[str, Any]],
+) -> str | None:
+    """Add max_points / points_earned to compact rows from the gradebook.
+
+    The DataDirect list has no point values, but `hydrategradebook` returns
+    every assignment in a (section, marking period) with `MaxPoints` and the
+    student's `PointsEarned`, keyed by AssignmentIndexId. One call per
+    distinct pair covers all rows. Rows are mutated in place; returns a
+    note describing any section whose gradebook could not be fetched.
+    """
+    pairs: dict[tuple[Any, Any], str] = {}
+    for item in raw_items:
+        sec = assignment_field(item, "section_id")
+        mp = item.get("marking_period_id")
+        # No marking period = not in a gradebook (ungraded block); skip.
+        if sec is None or mp is None:
+            continue
+        pairs.setdefault((sec, mp), str(assignment_field(item, "class") or sec))
+    if not pairs:
+        return None
+
+    student_id = _student_id()
+    by_index: dict[str, dict[str, Any]] = {}
+    failed: list[str] = []
+    for (sec, mp), label in pairs.items():
+        hydra = _request_assignment_component(
+            client,
+            "/api/gradebook/hydrategradebook",
+            params={
+                "sectionId": sec,
+                "markingPeriodId": mp,
+                "sortAssignmentId": "null",
+                "sortSkillPk": "null",
+                "sortDesc": "null",
+                "sortCumulative": "null",
+                "studentUserId": student_id,
+                "fromProgress": "true",
+            },
+        )
+        body = hydra.get("body")
+        if not _response_succeeded(hydra) or not isinstance(body, dict):
+            failed.append(label)
+            continue
+        for a in body.get("Assignments") or []:
+            idx = a.get("AssignmentIndexId")
+            if idx is not None:
+                by_index[str(idx)] = {"max_points": to_float(a.get("MaxPoints"))}
+        me = next(
+            (
+                r
+                for r in body.get("Roster") or []
+                if isinstance(r, dict)
+                and str(r.get("StudentUserId")) == str(student_id)
+            ),
+            None,
+        )
+        for g in (me or {}).get("AssignmentGrades") or []:
+            idx = g.get("AssignmentIndexId")
+            if idx is None:
+                continue
+            entry = by_index.setdefault(str(idx), {})
+            if entry.get("max_points") is None:
+                entry["max_points"] = to_float(g.get("MaxPoints"))
+            # Absent until graded; or_none keeps a real 0.
+            earned = or_none(g.get("PointsEarned"))
+            if earned is not None:
+                entry["points_earned"] = to_float(earned)
+
+    for row in rows:
+        entry = by_index.get(str(row.get("assignment_index_id")))
+        if entry:
+            row.update(entry)
+    if failed:
+        return "points unavailable for: " + ", ".join(sorted(set(failed)))
+    return None
 
 
 @mcp.tool()
