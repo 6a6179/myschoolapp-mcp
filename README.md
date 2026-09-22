@@ -23,7 +23,7 @@ session file; the generic `api_request` tool also supports write methods.
 
 ## Features
 
-All 32 tools, grouped by purpose:
+All 33 tools, grouped by purpose:
 
 - **Core** — `whoami`, `config`, `cookie_refresh`
 - **Assignments** — `assignments` (bucketed, compact by default),
@@ -36,6 +36,10 @@ All 32 tools, grouped by purpose:
   compact per-class views and auto-resolve the current academic term if
   you don't pass a `duration_id`; gradebook returns both the current
   marking-period and year-to-date grades when available),
+  `grade_breakdown` (splits a grade into weighted categories with points
+  earned/possible, each category's contribution, and the upcoming
+  ungraded work — every row is checked against the school's own posted
+  grade and carries a `verified` flag),
   `report_card_templates`, `transcript_templates`, `attendance`,
   `conduct`, `grade_levels`, `school_years` (exact enrolled/available year labels)
 - **Groups** — `group_membership` (advisory / athletic / dorm /
@@ -309,6 +313,7 @@ Ask your MCP client naturally:
 
 - "Show assignments due today and tomorrow, including their status."
 - "Show my current grades; distinguish unavailable grades from zeroes."
+- "What is my math grade made of, and what do I need on the next test?"
 - "What school events are on the calendar this week?"
 - "List the directories I can search."
 - "Which school years are available, and what reports can I list for one?"
@@ -318,6 +323,7 @@ Equivalent tool-call examples (not shell commands):
 ```text
 assignments(buckets="DueToday,DueTomorrow")
 gradebook()
+grade_breakdown()
 calendar_events(date_start="2026-09-07", date_end="2026-09-14")
 directory_list()
 school_years()
@@ -404,6 +410,20 @@ a fallback. This lists report metadata, not report document contents.
   hydrated and `graded=False` means no usable gradebook identifiers were
   returned, not proof that the historical class was ungraded. Use report
   cards for published historical results when this endpoint supplies no grades.
+- `grade_breakdown` recomputes the grade from category weights and
+  compares it to the school's posted `SectionGrade`. **Check `verified`
+  before trusting the split**: `true` means the recomputed grade matches
+  within 0.05, so projections ("what do I need on the final") are sound.
+  `false` means the teacher uses a scheme this doesn't model — total
+  points, per-marking-period weighting, or a manual override — and the
+  posted grade should be reported instead. A class with no grade posted
+  yet is not a mismatch; it carries a `no grade posted` note and is left
+  out of the top-level warning. Blackbaud exposes no category endpoint,
+  so weights are read off each assignment and deduped by
+  `AssignmentTypeId`; raw weights need not sum to 100 (a 7/63 split is
+  10%/90%) and are normalized over the categories that have at least one
+  graded item, so an empty category can't drag the grade toward zero.
+  Drop-lowest rules rank by ratio, not raw points.
 - Some tools use school-specific IDs (`categoryId` for official
   notes, `directoryId` for directories). The defaults in this repo
   match Tabor Academy; yours may differ. Use `directory_list()` for
