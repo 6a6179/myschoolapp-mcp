@@ -27,6 +27,7 @@ from .errors import SessionError, UserError
 from .formatting import (
     ASSIGNMENT_BUCKETS,
     DEFAULT_ASSIGNMENT_BUCKETS,
+    SENTINEL,
     STATUS_TYPE_LABELS,
     assignment_field,
     clean_schedule_item,
@@ -1088,19 +1089,8 @@ def gradebook(
             continue
 
         try:
-            hydra = client.request(
-                "GET",
-                "/api/gradebook/hydrategradebook",
-                params={
-                    "sectionId": lead_section_id,
-                    "markingPeriodId": marking_period_id,
-                    "sortAssignmentId": "null",
-                    "sortSkillPk": "null",
-                    "sortDesc": "null",
-                    "sortCumulative": "null",
-                    "studentUserId": student_id,
-                    "fromProgress": "true",
-                },
+            hydra = _hydrate_section(
+                client, lead_section_id, marking_period_id, student_id
             )
         except (httpx.HTTPError, RuntimeError, RequestBoundaryError) as exc:
             hydra = {
@@ -1159,6 +1149,343 @@ def gradebook(
             status_source="synthetic",
             error=f"Could not verify gradebook for {len(failures)} section(s)",
             partial=partial,
+        )
+    return result
+
+
+def _hydrate_section(
+    client: MyschoolappClient,
+    section_id: Any,
+    marking_period_id: Any,
+    student_id: Any,
+) -> dict[str, Any]:
+    """Fetch one section's raw gradebook. Shared by gradebook/grade_breakdown."""
+    return client.request(
+        "GET",
+        "/api/gradebook/hydrategradebook",
+        params={
+            "sectionId": section_id,
+            "markingPeriodId": marking_period_id,
+            "sortAssignmentId": "null",
+            "sortSkillPk": "null",
+            "sortDesc": "null",
+            "sortCumulative": "null",
+            "studentUserId": student_id,
+            "fromProgress": "true",
+        },
+    )
+
+
+def _split_categories(
+    body: dict[str, Any], student_id: Any
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Group a hydrategradebook body into weighted categories.
+
+    Blackbaud repeats the category weight on every assignment rather than
+    exposing a category list, so weights are deduped by AssignmentTypeId.
+    Raw weights need not sum to 100 (a 7/63 split means 10%/90%); each
+    category's share is its weight over the sum of distinct weights.
+
+    Returns (categories, ungraded_items). Assignments with IncCumGrade
+    false are excluded entirely — they are not part of the grade.
+    """
+    assignments = [a for a in (body.get("Assignments") or []) if isinstance(a, dict)]
+    me = next(
+        (
+            r
+            for r in body.get("Roster") or []
+            if isinstance(r, dict) and str(r.get("StudentUserId")) == str(student_id)
+        ),
+        None,
+    )
+    grades = {
+        g.get("AssignmentId"): g
+        for g in (me or {}).get("AssignmentGrades") or []
+        if isinstance(g, dict)
+    }
+
+    cats: dict[Any, dict[str, Any]] = {}
+    ungraded: list[dict[str, Any]] = []
+    for a in assignments:
+        if not a.get("IncCumGrade"):
+            continue
+        type_id = a.get("AssignmentTypeId")
+        cat = cats.setdefault(
+            type_id,
+            {
+                "category": a.get("AssignmentType"),
+                "category_id": type_id,
+                "weight_raw": to_float(a.get("Weight")),
+                "drop_lowest": (
+                    n
+                    if isinstance(n := a.get("NumberToDrop"), int)
+                    and n > 0
+                    and n != SENTINEL
+                    else 0
+                ),
+                "_scored": [],
+                "points_earned": 0.0,
+                "points_possible": 0.0,
+                "graded_count": 0,
+                "ungraded_count": 0,
+                "ungraded_points": 0.0,
+            },
+        )
+        g = grades.get(a.get("AssignmentId")) or {}
+        max_points = to_float(a.get("MaxPoints"))
+        extra_credit = bool(a.get("ExtraCredit"))
+        # PointsEarned is absent (not null) until graded; or_none keeps a real 0.
+        earned = to_float(or_none(g.get("PointsEarned")))
+        item = {
+            "title": a.get("AbbrDescription") or a.get("AssignShort") or "",
+            "due": a.get("DateDue"),
+            "category": a.get("AssignmentType"),
+            "max_points": max_points,
+            "points_earned": earned,
+            "extra_credit": extra_credit,
+        }
+        if earned is None or g.get("Exempt"):
+            # Exempt work never counts; ungraded work is not yet counted.
+            if not g.get("Exempt"):
+                cat["ungraded_count"] += 1
+                if not extra_credit and max_points:
+                    cat["ungraded_points"] += max_points
+                ungraded.append(item)
+            continue
+        cat["graded_count"] += 1
+        cat["_scored"].append(
+            {
+                "earned": earned,
+                "possible": 0.0 if extra_credit else (max_points or 0.0),
+                "item": item,
+            }
+        )
+
+    for cat in cats.values():
+        scored = cat.pop("_scored")
+        drop = cat["drop_lowest"]
+        dropped: list[dict[str, Any]] = []
+        if drop and len(scored) > drop:
+            # Rank by ratio so a 5-point miss doesn't outrank a 100-point one.
+            scored.sort(
+                key=lambda s: (s["earned"] / s["possible"]) if s["possible"] else 1.0
+            )
+            dropped = [s["item"] for s in scored[:drop]]
+            scored = scored[drop:]
+        for s in scored:
+            cat["points_earned"] += s["earned"]
+            cat["points_possible"] += s["possible"]
+        cat["dropped"] = dropped
+        cat["percent"] = (
+            round(cat["points_earned"] / cat["points_possible"] * 100, 4)
+            if cat["points_possible"]
+            else None
+        )
+        cat["percent_display"] = fmt_pct(cat["percent"])
+
+    active = [c for c in cats.values() if c["percent"] is not None]
+    weight_total = sum(c["weight_raw"] or 0.0 for c in active)
+    for cat in cats.values():
+        raw = cat["weight_raw"] or 0.0
+        share = (raw / weight_total * 100) if weight_total and raw else None
+        # Counted share is 0 until a category has its first graded item.
+        cat["weight_pct"] = (
+            round(share, 4) if share is not None and cat["percent"] is not None else 0.0
+        )
+        cat["contribution"] = (
+            round(cat["weight_pct"] * cat["percent"] / 100, 4)
+            if cat["percent"] is not None
+            else 0.0
+        )
+
+    ordered = sorted(
+        cats.values(), key=lambda c: (-(c["weight_raw"] or 0.0), str(c["category"]))
+    )
+    return ordered, ungraded
+
+
+@mcp.tool()
+def grade_breakdown(
+    section_id: int | None = None,
+    duration_id: int = 0,
+    school_year: str | None = None,
+    include_ungraded: bool = True,
+) -> dict[str, Any]:
+    """Break a class grade into weighted categories, verified against the school.
+
+    Answers "what is this grade made of" and "what do I need on the next
+    test" — neither of which `gradebook()` can do, since it returns only the
+    final percentage. Category weights live on each assignment in
+    `hydrategradebook` (Blackbaud has no category endpoint); this dedupes
+    them, applies drop-lowest rules, and recomputes the grade.
+
+    ALWAYS check `verified`. True means the recomputed grade matches the
+    posted `SectionGrade` within 0.05, so the category math is sound and
+    projections built on it are trustworthy. False means the teacher uses a
+    scheme this does not model (total-points, per-marking-period weighting,
+    manual overrides) — report the posted grade and say the breakdown is
+    unverified rather than projecting from it.
+
+    Args:
+        section_id: Lead section id (from `classes()` / `gradebook()`).
+            Omit to break down every graded class in the term.
+        duration_id: DurationId from `student_terms()`. 0 = current term.
+        school_year: Optional exact school-year label.
+        include_ungraded: Include the list of not-yet-graded assignments
+            (title, due, max_points) so upcoming work is visible.
+
+    Returns body as a list of:
+        {
+          "section_id": int, "class": str, "teacher": str,
+          "marking_period": str,
+          "posted_grade": float | None,     # what the school shows
+          "computed_grade": float | None,   # recomputed from categories
+          "verified": bool,                 # computed matches posted
+          "delta": float | None,            # computed - posted
+          "categories": [{
+             "category": str, "weight_raw": float,
+             "weight_pct": float,           # normalized share of grade
+             "points_earned": float, "points_possible": float,
+             "percent": float | None, "contribution": float,
+             "graded_count": int, "ungraded_count": int,
+             "ungraded_points": float,      # points still to come
+             "drop_lowest": int, "dropped": [...],
+          }],
+          "ungraded": [...],                # upcoming work
+        }
+    """
+    client = _get_client()
+    student_id = _student_id()
+    if not duration_id:
+        duration_id = (
+            _resolve_duration_id()
+            if school_year is None
+            else _resolve_duration_id(school_year=school_year)
+        )
+
+    classes_resp = (
+        _fetch_classes(duration_id)
+        if school_year is None
+        else _fetch_classes(duration_id, school_year=school_year)
+    )
+    if not _response_succeeded(classes_resp) or not isinstance(
+        classes_resp.get("body"), list
+    ):
+        return classes_resp
+
+    classes_list = [
+        c
+        for c in classes_resp["body"]
+        if c.get("leadsectionid") and c.get("markingperiodid")
+    ]
+    if section_id is not None:
+        classes_list = [
+            c
+            for c in classes_list
+            if int(c.get("leadsectionid") or 0) == int(section_id)
+        ]
+        if not classes_list:
+            raise UserError(
+                f"No graded class with section_id {section_id} in duration "
+                f"{duration_id}. Use classes() or gradebook() to list section ids."
+            )
+
+    out: list[dict[str, Any]] = []
+    for c in classes_list:
+        lead_section_id = c.get("leadsectionid")
+        marking_period_id = c.get("markingperiodid")
+        row: dict[str, Any] = {
+            "section_id": lead_section_id,
+            "class": c.get("sectionidentifier"),
+            "teacher": c.get("groupownername"),
+            "marking_period": c.get("currentterm"),
+            "marking_period_id": marking_period_id,
+            "posted_grade": None,
+            "posted_grade_display": None,
+            "computed_grade": None,
+            "computed_grade_display": None,
+            "verified": False,
+            "delta": None,
+            "categories": [],
+        }
+        try:
+            hydra = _hydrate_section(
+                client, lead_section_id, marking_period_id, student_id
+            )
+        except (httpx.HTTPError, RuntimeError, RequestBoundaryError) as exc:
+            row["error"] = f"hydrategradebook transport failure: {type(exc).__name__}"
+            out.append(row)
+            continue
+
+        body = hydra.get("body")
+        if not _response_succeeded(hydra) or not isinstance(body, dict):
+            row["error"] = f"hydrategradebook status {hydra.get('status')}"
+            out.append(row)
+            continue
+
+        me = next(
+            (
+                r
+                for r in body.get("Roster") or []
+                if isinstance(r, dict)
+                and str(r.get("StudentUserId")) == str(student_id)
+            ),
+            None,
+        )
+        if me is None:
+            row["error"] = "student not found in gradebook roster"
+            out.append(row)
+            continue
+
+        posted = to_float(me.get("SectionGrade"))
+        cats, ungraded = _split_categories(body, student_id)
+        computed = (
+            round(sum(c["contribution"] for c in cats), 4)
+            if any(c["percent"] is not None for c in cats)
+            else None
+        )
+        row["posted_grade"] = posted
+        row["posted_grade_display"] = fmt_pct(posted)
+        row["computed_grade"] = computed
+        row["computed_grade_display"] = fmt_pct(computed)
+        if posted is not None and computed is not None:
+            row["delta"] = round(computed - posted, 4)
+            row["verified"] = abs(row["delta"]) < 0.05
+        elif posted is None:
+            # Nothing published yet — no claim to verify against, so this is
+            # not a mismatch. Say so rather than implying the math is wrong.
+            row["note"] = "no grade posted for this class yet"
+        row["categories"] = cats
+        if include_ungraded:
+            row["ungraded"] = ungraded
+        out.append(row)
+
+    result: dict[str, Any] = {
+        "status": 200,
+        "duration_id": duration_id,
+        "body": out,
+    }
+    failures = [r for r in out if r.get("error")]
+    if failures:
+        partial = len(failures) < len(out)
+        result.update(
+            status=207 if partial else 502,
+            status_source="synthetic",
+            error=f"Could not read gradebook for {len(failures)} section(s)",
+            partial=partial,
+        )
+    unverified = [
+        r["class"]
+        for r in out
+        if not r.get("error") and not r["verified"] and r["posted_grade"] is not None
+    ]
+    if unverified:
+        result["note"] = (
+            "Recomputed grade does not match the posted grade for: "
+            + ", ".join(str(u) for u in unverified)
+            + ". The teacher likely uses a scheme this tool does not model "
+            "(total points, manual override). Trust posted_grade, not the "
+            "category split, for these."
         )
     return result
 
